@@ -1,0 +1,1048 @@
+{
+  "Agent": {
+    "schema": {
+      "additionalProperties": false,
+      "description": "Input schema for Agent tool",
+      "properties": {
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A short (3-5 word) description of the task",
+          "title": "Description"
+        },
+        "prompt": {
+          "description": "The task for the agent to perform",
+          "title": "Prompt",
+          "type": "string"
+        },
+        "subagent_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The type of specialized agent to use for this task",
+          "title": "Subagent Type"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "title": "AgentInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": false,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "Bash": {
+    "schema": {
+      "additionalProperties": false,
+      "description": "Input schema for Bash tool.",
+      "properties": {
+        "command": {
+          "description": "The command to execute",
+          "title": "Command",
+          "type": "string"
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional timeout in milliseconds (max 600000)",
+          "title": "Timeout"
+        },
+        "run_in_background": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Set to true to run this command in the background. Use Read to read the output later.",
+          "title": "Run In Background"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Clear, concise description of what this command does in active voice. Never use words like \"complex\" or \"risk\" in the description - just describe what it does.\n\nFor simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):\n- ls → \"List files in current directory\"\n- git status → \"Show working tree status\"\n- npm install → \"Install package dependencies\"\n\nFor commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:\n- find . -name \"*.tmp\" -exec rm {} \\; → \"Find and delete all .tmp files recursively\"\n- git reset --hard origin/main → \"Discard all local changes and match remote main\"\n- curl -s url | jq '.data[]' → \"Fetch JSON from URL and extract data array elements\"",
+          "title": "Description"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "BashInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 30000
+  },
+  "Glob": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "description": "The glob pattern to match files against",
+          "title": "Pattern",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided.",
+          "title": "Path"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "title": "GlobInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "Grep": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "description": "The regular expression pattern to search for in file contents",
+          "title": "Pattern",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File or directory to search in (rg PATH). Defaults to current working directory.",
+          "title": "Path"
+        },
+        "glob": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob",
+          "title": "Glob"
+        },
+        "output_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "content",
+                "files_with_matches",
+                "count"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"files_with_matches\".",
+          "title": "Output Mode"
+        },
+        "-B": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise.",
+          "title": "-B"
+        },
+        "-A": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise.",
+          "title": "-A"
+        },
+        "-C": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Alias for context.",
+          "title": "-C"
+        },
+        "context": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise.",
+          "title": "Context"
+        },
+        "-n": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Show line numbers in output (rg -n). Requires output_mode: \"content\", ignored otherwise. Defaults to true.",
+          "title": "-N"
+        },
+        "-i": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Case insensitive search (rg -i)",
+          "title": "-I"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.",
+          "title": "Type"
+        },
+        "head_limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).",
+          "title": "Head Limit"
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Skip first N lines/entries before applying head_limit, equivalent to \"| tail -n +N | head -N\". Works across all output modes. Defaults to 0.",
+          "title": "Offset"
+        },
+        "multiline": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
+          "title": "Multiline"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "title": "GrepInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 20000
+  },
+  "Read": {
+    "schema": {
+      "additionalProperties": false,
+      "description": "Input schema for FileRead tool (mirrors FileReadTool.ts inputSchema).",
+      "properties": {
+        "file_path": {
+          "description": "The absolute path to the file to read",
+          "title": "File Path",
+          "type": "string"
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The line number to start reading from. Only provide if the file is too large to read at once",
+          "title": "Offset"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The number of lines to read. Only provide if the file is too large to read at once.",
+          "title": "Limit"
+        },
+        "pages": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request.",
+          "title": "Pages"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "title": "FileReadInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": null
+  },
+  "Edit": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "file_path": {
+          "description": "The absolute path to the file to modify",
+          "title": "File Path",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "The text to replace",
+          "title": "Old String",
+          "type": "string"
+        },
+        "new_string": {
+          "description": "The text to replace it with (must be different from old_string)",
+          "title": "New String",
+          "type": "string"
+        },
+        "replace_all": {
+          "default": false,
+          "description": "Replace all occurrences of old_string (default false)",
+          "title": "Replace All",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "file_path",
+        "old_string",
+        "new_string"
+      ],
+      "title": "FileEditInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "Write": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "file_path": {
+          "description": "The absolute path to the file to write (must be absolute, not relative)",
+          "title": "File Path",
+          "type": "string"
+        },
+        "content": {
+          "description": "The content to write to the file",
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_path",
+        "content"
+      ],
+      "title": "FileWriteInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "TodoWrite": {
+    "schema": {
+      "$defs": {
+        "TodoItem": {
+          "properties": {
+            "content": {
+              "description": "Content cannot be empty",
+              "minLength": 1,
+              "title": "Content",
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "pending",
+                "in_progress",
+                "completed"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "activeForm": {
+              "description": "Active form cannot be empty",
+              "minLength": 1,
+              "title": "Activeform",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "status",
+            "activeForm"
+          ],
+          "title": "TodoItem",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "todos": {
+          "description": "The updated todo list",
+          "items": {
+            "$ref": "#/$defs/TodoItem"
+          },
+          "title": "Todos",
+          "type": "array"
+        }
+      },
+      "required": [
+        "todos"
+      ],
+      "title": "TodoWriteInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": false,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "AskUserQuestion": {
+    "schema": {
+      "$defs": {
+        "Question": {
+          "properties": {
+            "question": {
+              "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: \"Which library should we use for date formatting?\" If multiSelect is true, phrase it accordingly, e.g. \"Which features do you want to enable?\"",
+              "title": "Question",
+              "type": "string"
+            },
+            "header": {
+              "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\".",
+              "title": "Header",
+              "type": "string"
+            },
+            "options": {
+              "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+              "items": {
+                "$ref": "#/$defs/QuestionOption"
+              },
+              "maxItems": 4,
+              "minItems": 2,
+              "title": "Options",
+              "type": "array"
+            },
+            "multiSelect": {
+              "default": false,
+              "description": "Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive.",
+              "title": "Multiselect",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "question",
+            "header",
+            "options"
+          ],
+          "title": "Question",
+          "type": "object"
+        },
+        "QuestionOption": {
+          "properties": {
+            "label": {
+              "description": "The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice.",
+              "title": "Label",
+              "type": "string"
+            },
+            "description": {
+              "description": "Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications.",
+              "title": "Description",
+              "type": "string"
+            },
+            "preview": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options.",
+              "title": "Preview"
+            }
+          },
+          "required": [
+            "label",
+            "description"
+          ],
+          "title": "QuestionOption",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "questions": {
+          "description": "Questions to ask the user (1-4 questions)",
+          "items": {
+            "$ref": "#/$defs/Question"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Questions",
+          "type": "array"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional metadata for tracking and analytics purposes. Not displayed to user.",
+          "title": "Metadata"
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "title": "AskUserQuestionInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": false,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "NotebookEdit": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "notebook_path": {
+          "description": "The absolute path to the Jupyter notebook file to edit (must be absolute, not relative)",
+          "title": "Notebook Path",
+          "type": "string"
+        },
+        "cell_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID, or at the beginning if not specified.",
+          "title": "Cell Id"
+        },
+        "new_source": {
+          "description": "The new source for the cell",
+          "title": "New Source",
+          "type": "string"
+        },
+        "cell_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "code",
+                "markdown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The type of the cell (code or markdown). If not specified, it defaults to the current cell type. If using edit_mode=insert, this is required.",
+          "title": "Cell Type"
+        },
+        "edit_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "replace",
+                "insert",
+                "delete"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "replace",
+          "description": "The type of edit to make (replace, insert, delete). Defaults to replace.",
+          "title": "Edit Mode"
+        }
+      },
+      "required": [
+        "notebook_path",
+        "new_source"
+      ],
+      "title": "NotebookEditInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "WebFetch": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "description": "The URL to fetch content from",
+          "title": "Url",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "The prompt to run on the fetched content",
+          "title": "Prompt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "prompt"
+      ],
+      "title": "WebFetchInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "WebSearch": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "description": "The search query to use",
+          "minLength": 2,
+          "title": "Query",
+          "type": "string"
+        },
+        "allowed_domains": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Only include search results from these domains",
+          "title": "Allowed Domains"
+        },
+        "blocked_domains": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Never include search results from these domains",
+          "title": "Blocked Domains"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "WebSearchInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "SessionSearch": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "description": "Words to search for (ANDed, prefix-matched). \"Quote a word or phrase\" for exact matching.",
+          "title": "Query",
+          "type": "string"
+        },
+        "limit": {
+          "default": 8,
+          "description": "Maximum number of sessions to return",
+          "maximum": 20,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SessionSearchInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "EnterPlanMode": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "EnterPlanModeInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "ExitPlanMode": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "plan": {
+          "description": "The implementation plan to present to the user for approval (markdown). Should be concise and unambiguous.",
+          "title": "Plan",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan"
+      ],
+      "title": "ExitPlanModeInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": true,
+    "max_result_size_chars": 100000
+  },
+  "Skill": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "skill": {
+          "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\"",
+          "title": "Skill",
+          "type": "string"
+        },
+        "args": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional arguments for the skill",
+          "title": "Args"
+        }
+      },
+      "required": [
+        "skill"
+      ],
+      "title": "SkillInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": false,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "TaskOutput": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "description": "The task ID to get output from",
+          "title": "Task Id",
+          "type": "string"
+        },
+        "block": {
+          "default": true,
+          "description": "Whether to wait for completion",
+          "title": "Block",
+          "type": "boolean"
+        },
+        "timeout": {
+          "default": 30000,
+          "description": "Max wait time in ms",
+          "maximum": 600000,
+          "minimum": 0,
+          "title": "Timeout",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "title": "TaskOutputInput",
+      "type": "object"
+    },
+    "aliases": [
+      "AgentOutputTool",
+      "BashOutputTool"
+    ],
+    "is_read_only": true,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "TaskStop": {
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The ID of the background task to stop",
+          "title": "Task Id"
+        },
+        "shell_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Deprecated: use task_id instead",
+          "title": "Shell Id"
+        }
+      },
+      "title": "TaskStopInput",
+      "type": "object"
+    },
+    "aliases": [
+      "KillShell"
+    ],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 100000
+  },
+  "PowerShell": {
+    "schema": {
+      "additionalProperties": false,
+      "description": "Input schema for the PowerShell tool.",
+      "properties": {
+        "command": {
+          "description": "The PowerShell command to execute",
+          "title": "Command",
+          "type": "string"
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional timeout in milliseconds (max 600000)",
+          "title": "Timeout"
+        },
+        "run_in_background": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Set to true to run this command in the background. Use Read to read the output later.",
+          "title": "Run In Background"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Clear, concise description of what this command does in active voice.",
+          "title": "Description"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "PowerShellInput",
+      "type": "object"
+    },
+    "aliases": [],
+    "is_read_only": false,
+    "needs_permissions": true,
+    "always_ask": false,
+    "max_result_size_chars": 30000
+  }
+}

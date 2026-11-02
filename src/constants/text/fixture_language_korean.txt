@@ -1,0 +1,2 @@
+# Language
+Always respond in Korean. Use Korean for all explanations, comments, and communications with the user. Technical terms and code identifiers should remain in their original form. This also covers the tool inputs you author for other agents to read — write Agent prompts and descriptions in Korean too, never defaulting to English.

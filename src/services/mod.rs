@@ -1,0 +1,9 @@
+//! Services (codemason/services/).
+pub mod ab;
+pub mod backend;
+pub mod compaction;
+pub mod llamacpp;
+pub mod openai_common;
+pub mod prefill_probe;
+pub mod vision;
+pub mod vllm;

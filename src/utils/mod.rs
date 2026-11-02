@@ -1,0 +1,69 @@
+//! Utilities (codemason/utils/).
+pub mod escalation;
+pub mod arrow_picker;
+pub mod body_crypto;
+pub mod completion;
+pub mod config;
+pub mod difflib;
+pub mod env;
+pub mod file;
+pub mod formatting;
+pub mod generators;
+pub mod goal;
+pub mod hooks;
+pub mod image_prep;
+pub mod image_store;
+pub mod input_events;
+pub mod i18n;
+pub mod keep_going_installer;
+pub mod language;
+pub mod log;
+pub mod markdown;
+pub mod panic_guard;
+pub mod kill_agents_gesture;
+pub mod mcp_cli;
+pub mod mcp_client;
+pub mod memory;
+pub mod message_queue_manager;
+pub mod messages;
+pub mod paste_store;
+pub mod permissions;
+pub mod plan_mode;
+pub mod platform;
+pub mod prompt_engine;
+/// Windows-only substrate: reachable on Windows and from `cargo test`, dead in a
+/// non-Windows release build. Gate the lint, not the code — `#[cfg(windows)]` here
+/// would drop the path-conversion unit tests from every Linux `cargo test`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod powershell;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod powershell_detect;
+pub mod realtime_render;
+pub mod resume_picker;
+pub mod pager;
+pub mod ripgrep;
+pub mod serialization;
+pub mod session_index;
+pub mod session_status;
+pub mod session_storage;
+pub mod shell;
+pub mod skill_cli;
+pub mod wake_cli;
+pub mod subagent_gate;
+pub mod skills;
+pub mod spinner;
+pub mod state;
+pub mod stdio_encoding;
+pub mod steering_queue;
+pub mod surrogates;
+pub mod task;
+pub mod term_out;
+pub mod terminal_theme;
+pub mod todo_store;
+pub mod tokens;
+pub mod tool_result_storage;
+pub mod tty_compat;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod windows_shell;
+pub mod agent_id;
+pub mod cleanup_registry;

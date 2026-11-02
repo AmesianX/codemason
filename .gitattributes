@@ -1,0 +1,39 @@
+# Line endings are part of this project's contract, not a preference.
+#
+# src/constants/text/*.txt is embedded verbatim with include_str! and ends up
+# in the system prompt and the tool descriptions sent to the model. A Windows
+# clone with core.autocrlf=true checked those files out as CRLF, so the binary
+# shipped prompts whose every line ended \r\n while the code that composes the
+# surrounding text used \n. That broke the byte-for-byte rule against the
+# Python oracle (README, coding rule 1) and failed four prompt fixture tests.
+#
+# eol=lf pins the working tree to LF on every platform, which is what the index
+# already stores. After changing this file, run `git add --renormalize .` once
+# on a clone that was checked out with CRLF.
+* text=auto eol=lf
+
+# Binary: never translate, never diff as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.exe binary
+# The POSIX ripgrep binaries have no extension, so nothing above matches them
+# and they fall to `* text=auto`, i.e. to git's content heuristic. That happens
+# to answer "binary" today, but a 5MB executable should not depend on a guess:
+# a wrong answer would run eol=lf over it and corrupt it on checkout.
+vendor/ripgrep/*/rg binary
+*.dll binary
+*.so binary
+*.dylib binary
+
+# cmd.exe needs CRLF. With the LF working tree the global rule above produced,
+# `setup.bat` ran as garbage on a fresh clone: cmd tracks its position in a
+# batch file assuming \r\n and, on LF-only input, resumes each line a couple of
+# bytes late -- `setlocal` became `tlocal`, `echo` became `ho`, and the script
+# died at line 2. This rule is more specific than `*`, so it wins for .bat.
+*.bat text eol=crlf
