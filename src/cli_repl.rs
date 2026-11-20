@@ -954,8 +954,25 @@ pub async fn dispatch_builtin(
                 cmprintln!("Unknown mode: {want}   (off | on | auto)");
                 return Dispatch::Handled;
             };
+            // Report what the SERVER holds, not what we asked for: "/ab mode:
+            // on" used to print on a push that was silently skipped as
+            // already-there, while the server sat at 0.0 (see services::ab).
             match ab::set_mode(m).await {
-                Ok(()) => cmprintln!("/ab mode: {}", m.as_str()),
+                Ok(()) => {
+                    let served = match ab::query().await {
+                        Some((scale, consistent)) => {
+                            let state =
+                                if scale > 0.0 { "on (abliterated)" } else { "off (restored)" };
+                            if consistent {
+                                format!("server: {state}")
+                            } else {
+                                format!("server: {state} — WORKERS DISAGREE")
+                            }
+                        }
+                        None => "server: no /ab endpoint".to_string(),
+                    };
+                    cmprintln!("/ab mode: {}\n{served}", m.as_str());
+                }
                 Err(e) => cmprintln!("/ab mode: {} — server not updated: {e}", m.as_str()),
             }
             Dispatch::Handled

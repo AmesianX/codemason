@@ -102,10 +102,12 @@ pub fn mode() -> Mode {
 /// Set the mode and bring the server in line with it right away.
 pub async fn set_mode(m: Mode) -> Result<(), String> {
     *MODE.lock() = m;
+    // Forced: a command typed by the user must reach the server, never be
+    // answered from our guess about what it already holds. See `push_inner`.
     match m {
-        Mode::On => push(1.0).await,
+        Mode::On => push_inner(1.0, true).await,
         // Leaving auto or turning it off must not strand the server on.
-        Mode::Off | Mode::Auto => push(0.0).await,
+        Mode::Off | Mode::Auto => push_inner(0.0, true).await,
     }
 }
 
@@ -150,9 +152,28 @@ pub async fn begin_request() -> bool {
 /// turned off only on a tool call, which the collapsed turns of 2026-10-01
 /// never reached (see the module doc).
 pub async fn end_request(turned_on: bool) {
-    if turned_on {
-        let _ = push(0.0).await;
+    if !turned_on {
+        return;
     }
+    // The mode can change while the request is in flight, and this off was
+    // armed under the mode that held when it STARTED. `/ab on` typed mid-turn
+    // pins the edit deliberately; undoing it a moment later, on the strength of
+    // a decision the user has since overridden, is how the switch ended up
+    // stuck off while the REPL said "on" (2026-11-20):
+    //
+    //   turn in flight       begin_request pushed 1.0
+    //   user types /ab on    set_mode(On) -> 1.0, prints "/ab mode: on"
+    //   turn answers         end_request pushed 0.0   <-- stomps the pin
+    //   from then on         mode is On, so begin_request returns false and
+    //                        NOTHING ever pushes 1.0 again -- every later turn
+    //                        refuses, under a display that reads "on"
+    //
+    // `Off` still pushes: parking the server is always safe, and never
+    // stranding it on is the point of the pairing.
+    if mode() == Mode::On {
+        return;
+    }
+    let _ = push(0.0).await;
 }
 
 /// Ask the server what it currently holds. Used by `/ab` with no argument, so
@@ -180,13 +201,40 @@ fn endpoint() -> Option<(String, String)> {
     Some((format!("{base}/ab"), cfg.model_api_key.clone()))
 }
 
-/// Push a scale, skipping the request when the server already has it.
+/// Push a scale, skipping the request when we believe the server has it.
+async fn push(scale: f32) -> Result<(), String> {
+    push_inner(scale, false).await
+}
+
+/// Push a scale. `force` sends it even when `PUSHED` says it is already there.
+///
+/// `PUSHED` is a cache over a value this process does not own, and it has no
+/// invalidation: the server resets to `GLM53_AB_SCALE` (0) whenever it
+/// restarts, and every other client sharing it pushes its own scales. So it is
+/// a guess, and it goes stale silently.
+///
+/// Measured 2026-11-20 on the live lane. `/ab on` printed `/ab mode: on` and
+/// the model went on refusing, for hours. `set_mode(On)` had called
+/// `push(1.0)`, `PUSHED` was already `Some(1.0)` from before the vLLM
+/// container was restarted the previous morning, so the shortcut returned
+/// `Ok(())` without sending anything; `GET /ab` read `0.0` the whole time. The
+/// REPL has no way to tell that apart from a push that landed, because `Ok`
+/// meant "we think so", not "the server says so".
+///
+/// Two changes, both about not trusting our own guess:
+///   * an explicit user command forces the request (`set_mode`);
+///   * `PUSHED` is set from the scale the SERVER echoes, not from what we
+///     sent, and cleared when the server does not say -- so the next push
+///     cannot be skipped on the strength of an unconfirmed one.
+///
+/// The shortcut itself stays for `auto`: there both pushes are ours, inside
+/// one turn, and the pair is re-pushed on the next turn anyway.
 ///
 /// A failure is reported to the caller but never blocks the turn: a server
 /// without the plugin (or an llama.cpp backend) has no `/ab`, and that is a
 /// normal configuration, not an error worth interrupting work over.
-async fn push(scale: f32) -> Result<(), String> {
-    if *PUSHED.lock() == Some(scale) {
+async fn push_inner(scale: f32, force: bool) -> Result<(), String> {
+    if !force && *PUSHED.lock() == Some(scale) {
         return Ok(());
     }
     let (url, key) = match endpoint() {
@@ -205,9 +253,35 @@ async fn push(scale: f32) -> Result<(), String> {
     if !resp.status().is_success() {
         let code = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // The push did not land, and we no longer know what the server holds.
+        *PUSHED.lock() = None;
         return Err(format!("{code}: {}", body.trim()));
     }
-    *PUSHED.lock() = Some(scale);
+    // Believe the server, not ourselves. Our `/ab` answers with
+    // {"scale":..,"workers":[..],"consistent":bool}; anything else (another
+    // server, an empty 200) leaves us with no confirmation, so record none and
+    // let the next push go out rather than be skipped.
+    let body = resp.text().await.unwrap_or_default();
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
+    let served = parsed
+        .as_ref()
+        .and_then(|v| v.get("scale"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    *PUSHED.lock() = served;
+    if let Some(s) = served {
+        if (s - scale).abs() > 1e-6 {
+            return Err(format!("server took {s}, not {scale}"));
+        }
+    }
+    if parsed
+        .as_ref()
+        .and_then(|v| v.get("consistent"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return Err("workers disagree on the scale".into());
+    }
     Ok(())
 }
 
@@ -232,6 +306,13 @@ mod tests {
 mod hook_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    /// These tests drive process-global state -- `MODE`, `PUSHED`, `ARMED` and
+    /// the global `model_base_url` -- so they cannot run beside each other.
+    /// Without this they interleave: each one's pushes land on the other's stub
+    /// and both assertions read the wrong list. Async mutex, because the guard
+    /// is held across awaits.
+    static TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
     /// Minimal HTTP server: enough to record the scales we post, without
     /// pulling in a web framework for one test.
@@ -294,6 +375,7 @@ mod hook_tests {
     /// seven retries on the edited weights and the server left at 1.0.
     #[tokio::test]
     async fn auto_is_on_for_the_turns_first_request_and_off_when_it_answers() {
+        let _serial = TEST_LOCK.lock().await;
         let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
         let port = stub(seen.clone());
         // Restored at the end: the endpoint is global, so leaving it pointed at
@@ -325,11 +407,109 @@ mod hook_tests {
         assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0], "no further requests");
 
         // Pinned off: arming does nothing, so neither does the request pair.
-        set_mode(Mode::Off).await.unwrap();  // already 0.0, no request
+        // The mode command itself always goes out, even though we believe the
+        // server is already at 0.0 -- a user command is never answered from our
+        // guess (see push_inner).
+        set_mode(Mode::Off).await.unwrap();
         on_user_turn().await;
         assert!(!begin_request().await);
-        assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0]);
+        assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0, 0.0]);
 
+        crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
+    }
+
+    /// `/ab on` must reach the server even when we already think it is on.
+    ///
+    /// The 2026-11-20 bug: the server had been restarted under a session whose
+    /// `PUSHED` still read 1.0, so it was back at `GLM53_AB_SCALE=0` while we
+    /// believed it was edited. `set_mode(On)` hit the already-there shortcut,
+    /// returned Ok without sending a byte, and the REPL printed "/ab mode: on"
+    /// over a server at 0.0 -- the model went on refusing and the switch looked
+    /// broken. Nothing in the process can detect that state, which is exactly
+    /// why the command may not be cached.
+    #[tokio::test]
+    async fn an_explicit_mode_command_is_never_answered_from_the_cache() {
+        let _serial = TEST_LOCK.lock().await;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
+        let port = stub(seen.clone());
+        let previous_base_url = crate::utils::config::get_config().model_base_url;
+        crate::utils::config::update_config(|c| {
+            c.model_base_url = format!("http://127.0.0.1:{port}");
+        });
+
+        // Stand in for the stale belief: we think the server is at 1.0. It is
+        // not -- a restart put it back to 0.0 -- but nothing told us.
+        *PUSHED.lock() = Some(1.0);
+        *ARMED.lock() = false;
+
+        set_mode(Mode::On).await.unwrap();
+        assert_eq!(*seen.lock(), vec![1.0], "the user typed it; it must be sent");
+
+        // Same for the other direction, and for re-entering auto: both park the
+        // server, and neither may be skipped on a belief.
+        set_mode(Mode::Auto).await.unwrap();
+        set_mode(Mode::Auto).await.unwrap();
+        assert_eq!(*seen.lock(), vec![1.0, 0.0, 0.0]);
+
+        // The per-request shortcut inside `auto` is still a shortcut: both
+        // pushes of the pair are ours, within one turn.
+        on_user_turn().await;
+        let on = begin_request().await;
+        end_request(on).await;
+        on_user_turn().await;
+        let on = begin_request().await;
+        end_request(on).await;
+        assert_eq!(*seen.lock(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+
+        crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
+    }
+
+    /// `/ab on` typed while a turn is in flight must survive that turn ending.
+    ///
+    /// The off is armed at `begin_request` under the mode that held then. When
+    /// the user pins the edit mid-turn, the pending off is a decision they have
+    /// since overridden -- and because nothing re-pushes under `On`, letting it
+    /// through strands the server off for good, with the REPL reading "on".
+    /// That is the 2026-11-20 report: refusals that began mid-session and then
+    /// would not go away no matter how often `/ab on` was typed.
+    #[tokio::test]
+    async fn pinning_the_edit_mid_turn_survives_that_turn_ending() {
+        let _serial = TEST_LOCK.lock().await;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
+        let port = stub(seen.clone());
+        let previous_base_url = crate::utils::config::get_config().model_base_url;
+        crate::utils::config::update_config(|c| {
+            c.model_base_url = format!("http://127.0.0.1:{port}");
+        });
+        *PUSHED.lock() = None;
+        *ARMED.lock() = false;
+
+        set_mode(Mode::Auto).await.unwrap(); // 0.0
+        on_user_turn().await;
+        let on = begin_request().await; // 1.0 — the turn is now in flight
+        assert!(on);
+        assert_eq!(*seen.lock(), vec![0.0, 1.0]);
+
+        // The user pins it while that request is still being answered.
+        set_mode(Mode::On).await.unwrap();
+
+        // The turn answers. Its off must not undo the pin.
+        end_request(on).await;
+        assert_eq!(
+            *seen.lock(),
+            vec![0.0, 1.0, 1.0],
+            "the pending off must not stomp a mode the user pinned mid-turn"
+        );
+
+        // And it stays on: under `On` nothing re-pushes, so a stomp here would
+        // never be corrected.
+        on_user_turn().await;
+        let again = begin_request().await;
+        assert!(!again, "On does not arm per-request");
+        end_request(again).await;
+        assert_eq!(*seen.lock(), vec![0.0, 1.0, 1.0], "still pinned on");
+
+        set_mode(Mode::Auto).await.unwrap(); // park it for the next test
         crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
     }
 }
