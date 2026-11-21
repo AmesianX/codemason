@@ -186,6 +186,51 @@ pub async fn query() -> Option<(f32, bool)> {
         req = req.bearer_auth(key);
     }
     let body: serde_json::Value = req.send().await.ok()?.json().await.ok()?;
+    effective(&body)
+}
+
+/// The scale the server will actually apply, read out of an `/ab` body.
+///
+/// The lane's switch went per-token (`ab_switch.py`): the value that reaches
+/// the forward pass is `_default_scale`, which `fill_token_scales` writes into
+/// the step's vector for every request that did not send its own `ab_scale`,
+/// and which the server mirrors into each worker's `details[].default_scale`.
+/// The top-level `scale` is `get_scale()` — the legacy scalar `_scale`, which
+/// `_token_scale()` stops allocating the moment the per-token buffer is
+/// reserved, so it reads `0.0` for the life of the process.
+///
+/// Reading that field printed `server: off (restored)` over a server holding
+/// the edit ON (measured 2026-11-21: `POST {"scale":1}` answered
+/// `{"scale":1.0,"mode":"abliterated"}`, the `GET` right after it answered
+/// `{"scale":0.0,"mode":"original","details":[{"default_scale":1.0,..}]}`).
+/// It is the mirror image of the 2026-11-20 bug: the display said `on` over a
+/// server at 0.0, the fix was to believe the server instead of `PUSHED`, and
+/// the field we started believing had quietly stopped meaning anything.
+///
+/// `consistent` has the same hole — the server derives it from those
+/// always-zero scalars, so ranks holding different defaults still look agreed.
+/// Compare the per-worker defaults instead.
+///
+/// A body without `per_token` is a server from before that change (or another
+/// server entirely), and there the top-level pair is the right answer.
+fn effective(body: &serde_json::Value) -> Option<(f32, bool)> {
+    let per_token = body
+        .get("per_token")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if per_token {
+        if let Some(details) = body.get("details").and_then(|v| v.as_array()) {
+            let defaults: Vec<f32> = details
+                .iter()
+                .filter_map(|d| d.get("default_scale").and_then(|v| v.as_f64()))
+                .map(|v| v as f32)
+                .collect();
+            if let Some(&head) = defaults.first() {
+                let consistent = defaults.iter().all(|s| (s - head).abs() <= 1e-6);
+                return Some((head, consistent));
+            }
+        }
+    }
     Some((
         body.get("scale")?.as_f64()? as f32,
         body.get("consistent").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -263,24 +308,18 @@ async fn push_inner(scale: f32, force: bool) -> Result<(), String> {
     // let the next push go out rather than be skipped.
     let body = resp.text().await.unwrap_or_default();
     let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
-    let served = parsed
-        .as_ref()
-        .and_then(|v| v.get("scale"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32);
-    *PUSHED.lock() = served;
-    if let Some(s) = served {
+    // Through `effective`, so a POST that ever grows the per-token diagnostics
+    // is read the same way the GET is. On today's reply (scale/workers/
+    // consistent/mode) it is the top-level pair, unchanged.
+    let served = parsed.as_ref().and_then(effective);
+    *PUSHED.lock() = served.map(|(s, _)| s);
+    if let Some((s, consistent)) = served {
         if (s - scale).abs() > 1e-6 {
             return Err(format!("server took {s}, not {scale}"));
         }
-    }
-    if parsed
-        .as_ref()
-        .and_then(|v| v.get("consistent"))
-        .and_then(|v| v.as_bool())
-        == Some(false)
-    {
-        return Err("workers disagree on the scale".into());
+        if !consistent {
+            return Err("workers disagree on the scale".into());
+        }
     }
     Ok(())
 }
@@ -299,6 +338,51 @@ mod tests {
         for m in [Mode::Off, Mode::On, Mode::Auto] {
             assert_eq!(Mode::parse(m.as_str()), Some(m));
         }
+    }
+
+    /// The live lane's own answer, pasted from `GET /ab` on 2026-11-21 while
+    /// the edit was ON: top-level `scale` 0.0, `default_scale` 1.0. Reading the
+    /// top level printed `server: off (restored)` over an abliterated server.
+    #[test]
+    fn per_token_body_reports_the_default_not_the_dead_scalar() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"scale":0.0,"workers":[0.0,0.0],"consistent":true,"mode":"original",
+                "per_token":true,"buffer_tokens":9236,"fills":[41329,41329],
+                "details":[{"scale":0.0,"default_scale":1.0,"per_token":true},
+                           {"scale":0.0,"default_scale":1.0,"per_token":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(effective(&body), Some((1.0, true)));
+    }
+
+    /// `consistent` from the server is computed over the always-zero scalars,
+    /// so it says `true` while the ranks hold different defaults — which at TP=2
+    /// means the halves of the model disagree about which weights they are.
+    #[test]
+    fn per_token_disagreement_is_caught_even_when_the_server_says_consistent() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"scale":0.0,"consistent":true,"per_token":true,
+                "details":[{"default_scale":1.0},{"default_scale":0.0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(effective(&body), Some((1.0, false)));
+    }
+
+    /// A server from before the per-token change, and the POST reply, carry no
+    /// `per_token`: the top-level pair is the answer there and must stay so.
+    #[test]
+    fn legacy_body_still_reads_the_top_level_pair() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"scale":1.0,"workers":[1.0,1.0],"consistent":false,"mode":"abliterated"}"#,
+        )
+        .unwrap();
+        assert_eq!(effective(&body), Some((1.0, false)));
+        // per_token with the details missing is not something the plugin sends
+        // (it adds both or neither), but guessing 0.0 there would be the same
+        // mistake again, so fall back rather than invent.
+        let partial: serde_json::Value =
+            serde_json::from_str(r#"{"scale":1.0,"per_token":true}"#).unwrap();
+        assert_eq!(effective(&partial), Some((1.0, true)));
     }
 }
 
