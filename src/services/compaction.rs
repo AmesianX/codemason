@@ -1116,6 +1116,9 @@ pub async fn compact_conversation(
                 max_tokens: Some(summary_output_cap),
                 no_reasoning: true,
                 keep_thinking: false,
+                // Compaction is bookkeeping for whichever conversation owns it;
+                // it keeps the server default (0) rather than yielding.
+                priority: None,
             },
             on_token_update: on_token_update.clone(),
             on_content_delta: None,

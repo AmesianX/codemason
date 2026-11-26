@@ -1431,6 +1431,34 @@ pub struct QueryOptions {
     /// earlier turn's reasoning into the one request whose purpose is to shrink
     /// the history is the opposite of what it is for.
     pub keep_thinking: bool,
+    /// vLLM scheduling priority for THIS request (lower = served first; the
+    /// server default is 0). The query loop sets SUBAGENT_PRIORITY on every
+    /// sub-agent request so that, when the server runs
+    /// `--scheduling-policy priority`, a waiting main conversation is admitted
+    /// before waiting sub-agents. `None` sends no key at all — the main
+    /// conversation, compaction and every helper call stay exactly as before.
+    pub priority: Option<i64>,
+}
+
+/// Priority sent on sub-agent requests (main conversation: none = 0).
+pub const SUBAGENT_PRIORITY: i64 = 1;
+
+/// Set once a server has refused the `priority` field. vLLM documents that a
+/// non-zero priority is an error unless the server was started with
+/// `--scheduling-policy priority`; this deployment accepts and ignores it, but
+/// another server may not. After one refusal the key is no longer sent for the
+/// rest of the process.
+static PRIORITY_REJECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `priority` value to put on the wire, if any: only for the vLLM backend
+/// (llama.cpp has no such field) and only while no server has refused it.
+fn wire_priority(priority: Option<i64>, vllm_backend: bool) -> Option<i64> {
+    if vllm_backend && !PRIORITY_REJECTED.load(std::sync::atomic::Ordering::Relaxed) {
+        priority
+    } else {
+        None
+    }
 }
 
 /// The parameter bundle every backend query takes (the Python function's
@@ -2662,6 +2690,17 @@ async fn query_openai_compatible_inner(
         }
     }
 
+    // Request priority: vLLM only (continuous_usage_stats marks the vLLM
+    // backend; llama.cpp has no such field), and only until a server refuses
+    // it. See QueryOptions::priority.
+    let sent_priority = match wire_priority(options.priority, continuous_usage_stats) {
+        Some(p) => {
+            request_body["priority"] = json!(p);
+            true
+        }
+        None => false,
+    };
+
     debug_log("REQUEST BODY", Some(&request_body));
 
     // Prefix fingerprint. Set CODEMASON_PREFIX_DUMP=/path/to/file to append one
@@ -2869,6 +2908,29 @@ async fn query_openai_compatible_inner(
     if response.status().as_u16() != 200 {
         let status = response.status().as_u16();
         let error_text = response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        // A server that does not schedule by priority may refuse the field
+        // (vLLM: "Any priority other than 0 will raise an error if the served
+        // model does not use priority scheduling"). Stop sending it and ask
+        // again once, rather than failing the sub-agent outright.
+        if sent_priority
+            && status == 400
+            && String::from_utf8_lossy(&error_text).to_lowercase().contains("priority")
+        {
+            PRIORITY_REJECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::utils::log::log_error(
+                &"server refused the request priority field; sending without it from now on",
+                Some("openai_common: priority"),
+            );
+            return Box::pin(query_openai_compatible_inner(
+                params,
+                continuous_usage_stats,
+                repetition_detection,
+                reasoning_roundtrip,
+                max_images,
+                start_time,
+            ))
+            .await;
+        }
         // A rejected auth with no key configured is the one failure whose cause
         // the status alone hides: the request went out with no Authorization
         // header at all, so the server is answering "who are you", not "your
@@ -4499,5 +4561,22 @@ mod vision_convert_tests {
             user(vec![tool_result("t", vec![img_item()])]),
         ];
         assert_eq!(attached_image_count(&conv, 8), 1);
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn wire_priority_only_for_vllm_subagents_until_refused() {
+        PRIORITY_REJECTED.store(false, Ordering::Relaxed);
+        assert_eq!(wire_priority(Some(SUBAGENT_PRIORITY), true), Some(SUBAGENT_PRIORITY));
+        assert_eq!(wire_priority(None, true), None, "main conversation sends no key");
+        assert_eq!(wire_priority(Some(SUBAGENT_PRIORITY), false), None, "llama.cpp: never");
+        PRIORITY_REJECTED.store(true, Ordering::Relaxed);
+        assert_eq!(wire_priority(Some(SUBAGENT_PRIORITY), true), None, "after a refusal");
+        PRIORITY_REJECTED.store(false, Ordering::Relaxed);
     }
 }

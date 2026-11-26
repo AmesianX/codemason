@@ -675,6 +675,12 @@ pub fn query(params: QueryParams) -> MsgStream {
                     (Some(_), n) if n > 0 => Some(n),
                     _ => None,
                 },
+                // Sub-agents yield to the main conversation in the server's
+                // waiting queue (vLLM --scheduling-policy priority).
+                priority: tool_use_context
+                    .agent_id
+                    .as_ref()
+                    .map(|_| crate::services::openai_common::SUBAGENT_PRIORITY),
                 // NOTE (2026-09-28): every recovery recursion now passes
                 // suppress_reasoning: false, so both of these are false for
                 // conversation requests. Compaction sets its own no_reasoning
