@@ -369,8 +369,18 @@ fn create_assistant_message_obj(text: &str) -> AssistantMessage {
     }
 }
 
-/// Format system prompt with context.
-pub fn format_system_prompt_with_context(system_prompt: &[String], context: &BTreeMap<String, String>) -> String {
+/// The system prompt's sections with the context block appended -- NOT joined.
+///
+/// PRIVATE_CONTEXT_MARKER must reach the wire layer as its own section: that is
+/// where the request is split into a public system message (shared cache) and
+/// a private one (this session's). Joining here used to fold the marker into
+/// the text, so nothing was split and the marker itself reached the model
+/// (caught live 2026-11-27: other sessions got 0 shared-prefix hits). The
+/// context block is this user's, so it lands in the private half.
+pub fn system_prompt_sections_with_context(
+    system_prompt: &[String],
+    context: &BTreeMap<String, String>,
+) -> Vec<String> {
     let mut parts: Vec<String> = system_prompt.to_vec();
     if !context.is_empty() {
         let mut context_parts = Vec::new();
@@ -383,7 +393,16 @@ pub fn format_system_prompt_with_context(system_prompt: &[String], context: &BTr
             parts.push(context_parts.join("\n"));
         }
     }
-    parts.join("\n\n")
+    parts
+}
+
+/// Format system prompt with context, as one string (marker removed).
+pub fn format_system_prompt_with_context(system_prompt: &[String], context: &BTreeMap<String, String>) -> String {
+    system_prompt_sections_with_context(system_prompt, context)
+        .into_iter()
+        .filter(|s| s != crate::constants::prompts::PRIVATE_CONTEXT_MARKER)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Canonical signature of an assistant turn's tool calls, or None ("not a
@@ -643,7 +662,7 @@ pub fn query(params: QueryParams) -> MsgStream {
             }
         }
 
-        let full_system_prompt = format_system_prompt_with_context(&system_prompt, &context);
+        let full_system_prompt = system_prompt_sections_with_context(&system_prompt, &context);
 
         if tool_use_context.is_aborted() {
             yield Message::Assistant(create_assistant_message_obj(INTERRUPT_MESSAGE));
@@ -660,7 +679,7 @@ pub fn query(params: QueryParams) -> MsgStream {
         let ab_scale = crate::services::ab::request_scale();
         let mut assistant_message = query_model(QueryModelParams {
             messages: messages.clone(),
-            system_prompt: vec![full_system_prompt],
+            system_prompt: full_system_prompt,
             tools: tools.clone(),
             signal: Some(tool_use_context.abort_controller.clone()),
             options: QueryOptions {
@@ -2259,3 +2278,27 @@ mod steer_resume_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod private_split_path_tests {
+    use super::*;
+    use crate::constants::prompts::PRIVATE_CONTEXT_MARKER as M;
+
+    /// The path a real request takes: query's sections -> the wire layer's
+    /// system messages. The marker must survive the first step as its own
+    /// section and never appear in what is sent.
+    #[test]
+    fn the_marker_survives_query_and_splits_on_the_wire() {
+        let sp: Vec<String> = ["intro", "tools", M, "memory", "env"].iter().map(|s| s.to_string()).collect();
+        let mut ctx = BTreeMap::new();
+        ctx.insert("gitStatus".to_string(), "clean".to_string());
+        let sections = system_prompt_sections_with_context(&sp, &ctx);
+        let wire = crate::services::openai_common::system_prompt_messages(&sections);
+        assert_eq!(wire.len(), 2, "{wire:?}");
+        assert_eq!(wire[0], "intro\n\ntools");
+        assert!(wire[1].starts_with("memory\n\nenv") && wire[1].contains("<gitStatus>clean</gitStatus>"));
+        assert!(wire.iter().all(|m| !m.contains('\u{0}')), "marker reached the model");
+        assert!(!format_system_prompt_with_context(&sp, &ctx).contains('\u{0}'));
+    }
+}
+
