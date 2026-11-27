@@ -1491,8 +1491,10 @@ fn wire_vllm_xargs(
     }
     // Our leading system message is public (identical for every user): the
     // server may share its cache across sessions. See PRIVATE_CONTEXT_MARKER.
+    // 1, not true: vLLM's vllm_xargs schema (str | int | float) coerces a JSON
+    // bool to an int anyway, and the server checks for exactly 1.
     if share_system_prefix {
-        x.insert("cache_share_system_prefix".into(), json!(true));
+        x.insert("cache_share_system_prefix".into(), json!(1));
     }
     (!x.is_empty()).then(|| Value::Object(x))
 }
@@ -4654,11 +4656,11 @@ mod ab_wire_tests {
     fn the_public_system_prefix_is_offered_for_sharing_on_vllm_only() {
         assert_eq!(
             wire_vllm_xargs(Some(0.0), true, true),
-            Some(json!({"ab_scale": 0, "cache_share_system_prefix": true}))
+            Some(json!({"ab_scale": 0, "cache_share_system_prefix": 1}))
         );
         assert_eq!(
             wire_vllm_xargs(None, true, true),
-            Some(json!({"cache_share_system_prefix": true}))
+            Some(json!({"cache_share_system_prefix": 1}))
         );
         assert_eq!(wire_vllm_xargs(None, true, false), None, "llama.cpp: never");
     }
