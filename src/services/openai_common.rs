@@ -2806,31 +2806,66 @@ async fn query_openai_compatible_inner(
     {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        static PREV: Lazy<parking_lot::Mutex<Vec<(u64, usize)>>> =
-            Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+        // The previous request OF THE SAME CONVERSATION, keyed by its first
+        // message (the system prompt). One global "previous request" used to
+        // compare a turn against whatever ran last -- WebSearch's query planner,
+        // a sub-agent -- and call the whole conversation a break.
+        static PREV_BY_CONV: Lazy<parking_lot::Mutex<std::collections::HashMap<u64, Vec<(u64, usize)>>>> =
+            Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let empty: Vec<Value> = Vec::new();
+        let msgs: &Vec<Value> = request_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .unwrap_or(&empty);
         let mut now: Vec<(u64, usize)> = Vec::new();
-        if let Some(arr) = request_body.get("messages").and_then(|m| m.as_array()) {
-            for m in arr {
-                let text = py_json_dumps(m);
-                let mut h = DefaultHasher::new();
-                text.hash(&mut h);
-                now.push((h.finish(), text.len()));
-            }
+        for m in msgs {
+            let text = py_json_dumps(m);
+            let mut h = DefaultHasher::new();
+            text.hash(&mut h);
+            now.push((h.finish(), text.len()));
         }
-        let mut prev = PREV.lock();
+        let conv_key = now.first().map(|x| x.0).unwrap_or(0);
+        let mut by_conv = PREV_BY_CONV.lock();
+        if by_conv.len() > 64 && !by_conv.contains_key(&conv_key) {
+            by_conv.clear(); // bounded; losing history only costs one estimate
+        }
+        let prev = by_conv.entry(conv_key).or_default();
         // How much of this request the server cannot serve from its cache:
         // everything from the first message that differs. On a normal append
         // that is just the new tail; on a break it is the whole conversation.
         let diverge = (0..now.len().min(prev.len()))
             .find(|&i| prev[i] != now[i])
             .unwrap_or(prev.len().min(now.len()));
-        let tail: String = request_body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|arr| arr[diverge.min(arr.len())..].iter().map(py_json_dumps).collect())
-            .unwrap_or_default();
-        crate::utils::tokens::set_pending_prefill(
-            crate::utils::tokens::count_text_tokens(&tail),
+        let tokens_of = |range: std::ops::Range<usize>| -> i64 {
+            let r = range.start.min(msgs.len())..range.end.min(msgs.len());
+            let s: String = msgs[r].iter().map(py_json_dumps).collect();
+            crate::utils::tokens::count_text_tokens(&s)
+        };
+        crate::utils::tokens::set_pending_prefill(tokens_of(diverge..msgs.len()));
+        // New input vs. cold re-read (the spinner shows only the latter):
+        //  - same conversation as before: what was appended after the previous
+        //    request is new; earlier messages that changed are cold.
+        //  - first request of this conversation in this process: the trailing
+        //    user turn (everything after the last assistant message) is new;
+        //    whatever the server cannot serve of the rest -- a restart, a
+        //    resumed session -- is cold, and only the server can say how much.
+        let (new_from, client_cold) = if prev.is_empty() {
+            let last_assistant = msgs
+                .iter()
+                .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+            (last_assistant.map(|i| i + 1).unwrap_or(0), 0)
+        } else {
+            (prev.len(), if diverge < prev.len() { tokens_of(diverge..prev.len()) } else { 0 })
+        };
+        let tools_tokens = request_body
+            .get("tools")
+            .filter(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+            .map(|t| count_tokens_precise(&py_json_dumps(t)))
+            .unwrap_or(0);
+        crate::utils::tokens::set_prefill_expectation(
+            tokens_of(new_from..msgs.len()),
+            client_cold,
+            tokens_of(0..msgs.len()) + tools_tokens,
         );
 
         // Only compare against a strictly shorter history: a NEW conversation
@@ -2855,6 +2890,7 @@ async fn query_openai_compatible_inner(
             }
         }
         *prev = now;
+        drop(by_conv);
     }
 
     if let Ok(dump_path) = std::env::var("CODEMASON_PREFIX_DUMP") {

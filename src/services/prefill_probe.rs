@@ -72,7 +72,7 @@ pub fn probe_next_request() {
         let Some((url, key)) = metrics_url_and_key() else {
             return done();
         };
-        let Some((q0, h0)) = read_counters(&url, &key).await else {
+        let Some((mut q0, mut h0)) = read_counters(&url, &key).await else {
             return done(); // no counters: the client-side estimate stands
         };
         // Scheduling lands within a few seconds; past that the request is
@@ -86,20 +86,35 @@ pub fn probe_next_request() {
             let Some((q, h)) = read_counters(&url, &key).await else { break };
             if q > q0 {
                 let (queried, cached) = (q - q0, h - h0);
+                // The counters are server-wide: a delta far from our own prompt
+                // size is someone else's request (another user, a probe). Take
+                // it as the new baseline and keep waiting for ours rather than
+                // show a stranger's prefill as this turn's (2026-11-27).
+                let expected = crate::utils::tokens::expected_prompt_tokens();
+                if expected > 0
+                    && ((queried as f64) < 0.7 * expected as f64
+                        || (queried as f64) > 1.3 * expected as f64)
+                {
+                    q0 = q;
+                    h0 = h;
+                    continue;
+                }
                 let compute = queried - cached;
                 crate::utils::tokens::set_pending_prefill_measured(compute, cached);
+                let (cold, _) = crate::utils::tokens::cold_prefill();
                 // A cold or badly-degraded prefix is the single most expensive
                 // thing that happens without saying so. Record it where an
                 // unattended run leaves a trace: at ~1,335 tok/s a 73k re-read
                 // is 55 seconds of silence that otherwise looks like a hang,
                 // and afterwards nothing in the transcript says it happened.
                 let hit = if queried > 0 { 100.0 * cached as f64 / queried as f64 } else { 100.0 };
-                if compute > 20_000 && hit < 50.0 {
+                if cold > 20_000 {
                     crate::utils::log::log_error(
                         &format!(
-                            "cold prefill: {compute} of {queried} prompt tokens must be recomputed \
-                             ({hit:.1}% served from cache) — about {:.0}s before the first token",
-                            compute as f64 / 1335.0
+                            "cold prefill: {cold} already-sent tokens must be recomputed \
+                             ({compute} computed of {queried}, {hit:.1}% served from cache) \
+                             — about {:.0}s before the first token",
+                            cold as f64 / 1335.0
                         ),
                         Some("prefill_probe: vllm /metrics"),
                     );

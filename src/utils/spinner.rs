@@ -162,12 +162,11 @@ fn pick_verb() -> String {
 }
 
 /// Shared spinner state (the REPL holds one across the whole session).
-/// Prefill big enough that the wait is the prompt rather than the model, and
-/// so worth saying out loud without -dbg. At the cold rate measured for this
-/// deployment (1,335 tok/s) this is roughly 15 seconds before the first token
-/// -- about where an unexplained spinner starts reading as a hang. Below it the
-/// status line stays as clean as it was.
-const PREFILL_NOTEWORTHY_TOKENS: i64 = 20_000;
+/// COLD prefill (already-sent input the server must compute again) worth
+/// showing. The hybrid model resumes from KDA checkpoints on a 4,608-token grid
+/// plus a 512-token tail, so up to ~5k of a warm request is recomputed by
+/// design; past 8k it is a real break (2026-11-27).
+const COLD_NOTEWORTHY_TOKENS: i64 = 8_192;
 
 pub struct StreamingSpinner {
     frames: &'static [&'static str],
@@ -405,40 +404,39 @@ impl StreamingSpinner {
         if self.token_count.load(Ordering::SeqCst) > 0 {
             return String::new();
         }
-        let p = crate::utils::tokens::pending_prefill();
-        if p <= 0 {
-            return String::new();
-        }
-        // Under -dbg: always, as a diagnostic. Otherwise only when the wait is
-        // the PROMPT and not the model, which is the one case where silence is
-        // indistinguishable from a freeze.
-        //
-        // The clean-line argument above still holds for ordinary turns, and
-        // they stay clean: a warm request re-reads a few thousand tokens and
-        // never crosses the bar. What it did not cover is a reduction clearing
-        // an early tool result, which invalidates every cached token after it:
-        // on 2026-10-03 17:55 that was 242,795 tokens at 0.0% cache hit and 182
-        // seconds before the first token, spent showing the turn's own label
-        // and no reason at all.
-        if !crate::utils::log::debug_enabled() && p < PREFILL_NOTEWORTHY_TOKENS {
-            return String::new();
-        }
+        // Only COLD prefill is news: input this conversation already sent that
+        // the server must compute again (a broken cached prefix, a restart, a
+        // resumed session). The new input -- a 30k-character WebSearch result,
+        // the next question -- is read on every request and used to show up
+        // here as "to prefill", indistinguishable from a break (2026-11-27).
+        let (cold, measured) = crate::utils::tokens::cold_prefill();
+        let new_input = crate::utils::tokens::new_input_tokens();
         let cached = crate::utils::tokens::pending_cached();
         // '~' marks our own estimate; no mark means vLLM counted it.
-        let mark = if crate::utils::tokens::prefill_is_measured() { "" } else { "~" };
-        let hit = if cached > 0 {
-            format!(", {} cached", format_tokens_compact(cached))
-        } else {
-            String::new()
-        };
-        format!(
-            " {} {} {}{} to prefill{}",
-            sym("dot"),
-            sym("up"),
-            mark,
-            format_tokens_compact(p),
-            hit
-        )
+        let mark = if measured { "" } else { "~" };
+        if crate::utils::log::debug_enabled() {
+            if cold <= 0 && new_input <= 0 {
+                return String::new();
+            }
+            let hit = if cached > 0 {
+                format!(", {} cached", format_tokens_compact(cached))
+            } else {
+                String::new()
+            };
+            return format!(
+                " {} {} {} new · ⟲ {}{} re-read{}",
+                sym("dot"),
+                sym("up"),
+                format_tokens_compact(new_input),
+                mark,
+                format_tokens_compact(cold),
+                hit
+            );
+        }
+        if cold < COLD_NOTEWORTHY_TOKENS {
+            return String::new();
+        }
+        format!(" {} ⟲ {}{} re-read", sym("dot"), mark, format_tokens_compact(cold))
     }
 
     /// ' · ✻ 234 thinking', or '' when this turn did no thinking. The thinking
@@ -619,7 +617,7 @@ mod wait_note_display_tests {
 
         assert!(with.starts_with(without.trim_end()), "note must only append");
         assert!(with.ends_with("fetching example.com"));
-        assert!(without.contains("to prefill"), "prefill readout kept: {without}");
+        assert!(without.contains("re-read"), "prefill readout kept: {without}");
 
         crate::utils::tokens::set_wait_note(None);
         crate::utils::tokens::reset_prefill_state();
@@ -684,12 +682,28 @@ mod pin_verb_tests {
         crate::utils::tokens::reset_prefill_state();
         crate::utils::tokens::set_pending_prefill_measured(2_000, 400_000);
         let warm = s.toolbar_text();
-        assert!(!warm.contains("to prefill"), "warm request must stay quiet: {warm}");
+        assert!(!warm.contains("re-read"), "warm request must stay quiet: {warm}");
 
         crate::utils::tokens::reset_prefill_state();
         crate::utils::tokens::set_pending_prefill_measured(242_795, 0);
         let cold = s.toolbar_text();
-        assert!(cold.contains("to prefill"), "a cold prefill must say so: {cold}");
+        assert!(cold.contains("re-read"), "a cold prefill must say so: {cold}");
+
+        // The case that started this (2026-11-27): a 30k-character WebSearch
+        // result is ~20k tokens of NEW input. Reading it is the request's
+        // normal cost, not a break -- it must not light the readout up.
+        crate::utils::tokens::reset_prefill_state();
+        crate::utils::tokens::set_prefill_expectation(20_000, 0, 80_000);
+        crate::utils::tokens::set_pending_prefill_measured(21_500, 58_500);
+        let new_input = s.toolbar_text();
+        assert!(!new_input.contains("re-read"), "new input is not cold: {new_input}");
+
+        // ...while the same new input on top of a re-read of earlier turns is.
+        crate::utils::tokens::reset_prefill_state();
+        crate::utils::tokens::set_prefill_expectation(20_000, 0, 80_000);
+        crate::utils::tokens::set_pending_prefill_measured(58_000, 22_000);
+        let broke = s.toolbar_text();
+        assert!(broke.contains("38k re-read"), "the re-read part is shown: {broke}");
 
         crate::utils::tokens::reset_prefill_state();
     }

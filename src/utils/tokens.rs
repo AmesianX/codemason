@@ -1078,6 +1078,49 @@ static PENDING_CACHED: AtomicI64 = AtomicI64::new(0);
 /// True once the number came from the server rather than our own estimate.
 static PREFILL_MEASURED: AtomicBool = AtomicBool::new(false);
 static OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
+/// Tokens of input this request sends for the FIRST time: the messages added
+/// since the previous request of the same conversation (a tool result, the new
+/// question). Reading them is the normal cost of a request, never news.
+static NEW_INPUT: AtomicI64 = AtomicI64::new(0);
+/// Re-read the client can see on its own: tokens of earlier messages that
+/// changed since the previous request (a rewritten/dropped message).
+static CLIENT_COLD: AtomicI64 = AtomicI64::new(0);
+/// Our estimate of this request's whole prompt, to tell the server's global
+/// counters apart from someone else's request (prefill_probe).
+static EXPECTED_PROMPT: AtomicI64 = AtomicI64::new(0);
+
+/// What this request is expected to cost: `new_input` first-time tokens,
+/// `client_cold` already-sent tokens the client itself knows must be re-read,
+/// and the whole prompt's size.
+pub fn set_prefill_expectation(new_input: i64, client_cold: i64, expected_prompt: i64) {
+    NEW_INPUT.store(new_input.max(0), AOrd::Relaxed);
+    CLIENT_COLD.store(client_cold.max(0), AOrd::Relaxed);
+    EXPECTED_PROMPT.store(expected_prompt.max(0), AOrd::Relaxed);
+}
+
+pub fn new_input_tokens() -> i64 {
+    NEW_INPUT.load(AOrd::Relaxed)
+}
+
+pub fn expected_prompt_tokens() -> i64 {
+    EXPECTED_PROMPT.load(AOrd::Relaxed)
+}
+
+/// COLD prefill: tokens this conversation already sent that the server must
+/// compute again -- a broken cached prefix, a restart, a resumed session. The
+/// only prefill worth showing: the new input is read every time and says
+/// nothing. With the server's measurement it is (computed - new input), which
+/// also catches breaks the client cannot see (the chat template re-rendering
+/// earlier turns, a cache namespace miss); without it, the client's own count.
+/// Returns (tokens, measured).
+pub fn cold_prefill() -> (i64, bool) {
+    if PREFILL_MEASURED.load(AOrd::Relaxed) {
+        let cold = PENDING_PREFILL.load(AOrd::Relaxed) - NEW_INPUT.load(AOrd::Relaxed);
+        (cold.max(0), true)
+    } else {
+        (CLIENT_COLD.load(AOrd::Relaxed), false)
+    }
+}
 
 /// Our own estimate, from comparing this request against the previous one.
 /// Available immediately; superseded by the server's number when it arrives.
@@ -1118,6 +1161,9 @@ pub fn reset_prefill_state() {
     PENDING_CACHED.store(0, AOrd::Relaxed);
     PREFILL_MEASURED.store(false, AOrd::Relaxed);
     OUTPUT_STARTED.store(false, AOrd::Relaxed);
+    NEW_INPUT.store(0, AOrd::Relaxed);
+    CLIENT_COLD.store(0, AOrd::Relaxed);
+    EXPECTED_PROMPT.store(0, AOrd::Relaxed);
 }
 
 pub fn mark_output_started() {
