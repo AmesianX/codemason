@@ -534,7 +534,30 @@ pub fn build_system_prompt_with_cwd_emphasis(system_prompt: &[String]) -> String
     //
     // Do not put it back. Anything that varies within a session belongs after
     // the history, never before it.
-    system_prompt.join("\n\n")
+    join_sections(system_prompt.iter().filter(|s| !is_private_marker(s)))
+}
+
+fn is_private_marker(section: &str) -> bool {
+    section == crate::constants::prompts::PRIVATE_CONTEXT_MARKER
+}
+
+fn join_sections<'a>(sections: impl Iterator<Item = &'a String>) -> String {
+    sections.map(String::as_str).collect::<Vec<_>>().join("\n\n")
+}
+
+/// The system prompt as the system messages to send: one message, or two when
+/// it carries PRIVATE_CONTEXT_MARKER -- the public half (identical for every
+/// user of this version) and the private half (memory, environment, ...).
+/// Two messages render as two `<|system|>` blocks, which is the boundary the
+/// server shares the public half up to (see `cache_share_system_prefix`).
+pub fn system_prompt_messages(system_prompt: &[String]) -> Vec<String> {
+    match system_prompt.iter().position(|s| is_private_marker(s)) {
+        Some(at) if at > 0 && at + 1 < system_prompt.len() => vec![
+            join_sections(system_prompt[..at].iter()),
+            join_sections(system_prompt[at + 1..].iter().filter(|s| !is_private_marker(s))),
+        ],
+        _ => vec![build_system_prompt_with_cwd_emphasis(system_prompt)],
+    }
 }
 
 // === Chat Message Types ===
@@ -795,13 +818,16 @@ pub fn convert_to_chat_messages(
     // request is past, and its label never flips.
     let mut shown: std::collections::HashSet<usize> = Default::default();
 
-    // Add system prompt with cwd emphasis
+    // System prompt: public half and private half as separate system messages
+    // when the marker is present (system_prompt_messages).
     if !system_prompt.is_empty() {
-        chat_messages.push(ChatMessage {
-            role: "system".into(),
-            content: Some(build_system_prompt_with_cwd_emphasis(system_prompt)),
-            ..Default::default()
-        });
+        for content in system_prompt_messages(system_prompt) {
+            chat_messages.push(ChatMessage {
+                role: "system".into(),
+                content: Some(content),
+                ..Default::default()
+            });
+        }
     }
 
     debug_log(
@@ -1451,13 +1477,24 @@ pub struct QueryOptions {
 /// vLLM only (llama.cpp has no such field). The server validates the value
 /// itself and runs anything that is not a finite number in [0, 1] on the
 /// original weights; this side sends only 0 or 1 anyway.
-fn wire_vllm_xargs(ab_scale: Option<f32>, vllm_backend: bool) -> Option<Value> {
-    match ab_scale {
-        Some(s) if vllm_backend && s.is_finite() => {
-            Some(json!({ "ab_scale": if s > 0.0 { 1 } else { 0 } }))
-        }
-        _ => None,
+fn wire_vllm_xargs(
+    ab_scale: Option<f32>,
+    share_system_prefix: bool,
+    vllm_backend: bool,
+) -> Option<Value> {
+    if !vllm_backend {
+        return None;
     }
+    let mut x = serde_json::Map::new();
+    if let Some(s) = ab_scale.filter(|s| s.is_finite()) {
+        x.insert("ab_scale".into(), json!(if s > 0.0 { 1 } else { 0 }));
+    }
+    // Our leading system message is public (identical for every user): the
+    // server may share its cache across sessions. See PRIVATE_CONTEXT_MARKER.
+    if share_system_prefix {
+        x.insert("cache_share_system_prefix".into(), json!(true));
+    }
+    (!x.is_empty()).then(|| Value::Object(x))
 }
 
 /// Priority sent on sub-agent requests (main conversation: none = 0).
@@ -2541,7 +2578,7 @@ async fn query_openai_compatible_inner(
             oob += count_tokens_precise(&py_json_dumps(&Value::Array(tool_schemas.clone())));
         }
         if !params.system_prompt.is_empty() {
-            oob += count_tokens_precise(&params.system_prompt.join("\n\n"));
+            oob += count_tokens_precise(&system_prompt_messages(&params.system_prompt).join("\n\n"));
         }
         crate::utils::tokens::set_out_of_band_tokens(&tool_cache_key, oob);
     }
@@ -2722,7 +2759,8 @@ async fn query_openai_compatible_inner(
     };
 
     // The /ab edit, per request (vLLM only). See QueryOptions::ab_scale.
-    if let Some(x) = wire_vllm_xargs(options.ab_scale, continuous_usage_stats) {
+    let share_system_prefix = system_prompt_messages(&params.system_prompt).len() > 1;
+    if let Some(x) = wire_vllm_xargs(options.ab_scale, share_system_prefix, continuous_usage_stats) {
         request_body["vllm_xargs"] = x;
     }
 
@@ -2890,6 +2928,12 @@ async fn query_openai_compatible_inner(
     } else {
         None
     };
+
+    // The gateway derives this session's cache salt from it and removes it; it
+    // only ever travels inside the encrypted body. See utils::cache_session.
+    if aes_key.is_some() && continuous_usage_stats {
+        request_body["cache_session"] = json!(crate::utils::cache_session::id());
+    }
 
     let url = format!("{}/v1/chat/completions", cfg.model_base_url);
     // No per-request .timeout(): in reqwest that is a TOTAL deadline over the
@@ -4595,15 +4639,54 @@ mod ab_wire_tests {
 
     #[test]
     fn ab_scale_rides_on_the_request_for_vllm_only() {
-        assert_eq!(wire_vllm_xargs(Some(1.0), true), Some(json!({"ab_scale": 1})));
+        assert_eq!(wire_vllm_xargs(Some(1.0), false, true), Some(json!({"ab_scale": 1})));
         assert_eq!(
-            wire_vllm_xargs(Some(0.0), true),
+            wire_vllm_xargs(Some(0.0), false, true),
             Some(json!({"ab_scale": 0})),
             "off is said explicitly, not left to the server default"
         );
-        assert_eq!(wire_vllm_xargs(None, true), None, "compaction/helpers: no key");
-        assert_eq!(wire_vllm_xargs(Some(1.0), false), None, "llama.cpp: never");
-        assert_eq!(wire_vllm_xargs(Some(f32::NAN), true), None, "never put NaN on the wire");
+        assert_eq!(wire_vllm_xargs(None, false, true), None, "compaction/helpers: no key");
+        assert_eq!(wire_vllm_xargs(Some(1.0), true, false), None, "llama.cpp: never");
+        assert_eq!(wire_vllm_xargs(Some(f32::NAN), false, true), None, "never put NaN on the wire");
+    }
+
+    #[test]
+    fn the_public_system_prefix_is_offered_for_sharing_on_vllm_only() {
+        assert_eq!(
+            wire_vllm_xargs(Some(0.0), true, true),
+            Some(json!({"ab_scale": 0, "cache_share_system_prefix": true}))
+        );
+        assert_eq!(
+            wire_vllm_xargs(None, true, true),
+            Some(json!({"cache_share_system_prefix": true}))
+        );
+        assert_eq!(wire_vllm_xargs(None, true, false), None, "llama.cpp: never");
+    }
+}
+
+#[cfg(test)]
+mod system_split_tests {
+    use super::*;
+    use crate::constants::prompts::PRIVATE_CONTEXT_MARKER as M;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_marker_splits_public_from_private_and_never_reaches_the_model() {
+        let out = system_prompt_messages(&v(&["intro", "tools", M, "memory", "env"]));
+        assert_eq!(out, vec!["intro\n\ntools".to_string(), "memory\n\nenv".to_string()]);
+        assert!(out.iter().all(|m| !m.contains('\u{0}')));
+    }
+
+    #[test]
+    fn without_a_usable_split_it_is_one_message_as_before() {
+        assert_eq!(system_prompt_messages(&v(&["a", "b"])), vec!["a\n\nb".to_string()]);
+        // Nothing public before it, or nothing private after it: no split.
+        assert_eq!(system_prompt_messages(&v(&[M, "env"])), vec!["env".to_string()]);
+        assert_eq!(system_prompt_messages(&v(&["intro", M])), vec!["intro".to_string()]);
+        assert_eq!(build_system_prompt_with_cwd_emphasis(&v(&["a", M, "b"])), "a\n\nb");
     }
 }
 

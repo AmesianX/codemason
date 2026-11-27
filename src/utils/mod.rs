@@ -2,6 +2,7 @@
 pub mod escalation;
 pub mod arrow_picker;
 pub mod body_crypto;
+pub mod cache_session;
 pub mod completion;
 pub mod config;
 pub mod difflib;

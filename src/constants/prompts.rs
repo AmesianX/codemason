@@ -715,6 +715,20 @@ pub async fn load_memory_prompt() -> Option<String> {
 // === Main assembly ===
 
 /// Port of getSystemPrompt — returns the system prompt as a list of sections.
+/// Where the system prompt stops being the same for every user.
+///
+/// Sections before it (instructions, tool usage, vision) are identical in every
+/// codemason session of the same version; sections after it (memory,
+/// environment, operator directive, ...) are this user's own. The wire layer
+/// sends the two halves as separate system messages and asks the server to
+/// share only the first (`vllm_xargs.cache_share_system_prefix`): with a
+/// per-session cache salt, the public half -- tool schema included, most of
+/// the prompt -- is served from one shared cache entry, and everything private
+/// stays in this session's own namespace. The server decides the boundary from
+/// the tokens; this marker only says where our own public part ends. It never
+/// reaches the model.
+pub const PRIVATE_CONTEXT_MARKER: &str = "\u{0}codemason:private-context\u{0}";
+
 pub async fn get_system_prompt(
     tools: &[Arc<dyn Tool>],
     model: Option<&str>,
@@ -750,6 +764,7 @@ pub async fn get_system_prompt(
     sections.push(get_session_specific_guidance_section(&enabled_tools, &config));
     sections.push(get_background_callback_section(&enabled_tools));
     sections.push(get_vision_section(crate::services::vision::enabled_limit().await));
+    sections.push(Some(PRIVATE_CONTEXT_MARKER.to_string()));
     sections.push(load_memory_prompt().await);
     sections.push(Some(compute_simple_env_info(
         &model,
@@ -788,6 +803,7 @@ pub async fn get_agent_prompt(
     vec![
         DEFAULT_AGENT_PROMPT.to_string(),
         AGENT_NOTES.to_string(),
+        PRIVATE_CONTEXT_MARKER.to_string(),
         env_info,
     ]
 }
@@ -950,7 +966,11 @@ pub fn agent_prefix_sections(model_id: &str) -> Vec<String> {
             return v.clone();
         }
     }
-    let mut v = vec![AGENT_NOTES.to_string(), compute_env_info(model_id, None)];
+    let mut v = vec![
+        AGENT_NOTES.to_string(),
+        PRIVATE_CONTEXT_MARKER.to_string(),
+        compute_env_info(model_id, None),
+    ];
     if let Some(s) = &vision {
         v.push(s.clone());
     }
