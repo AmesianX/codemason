@@ -1094,7 +1094,7 @@ pub fn print_help(tools: Option<&[Arc<dyn Tool>]>) {
   /compact      - Summarize the conversation to free context
   /remote       - /remote [on|off]  (remote channel status/toggle, alias /rc)
   /dsp          - /dsp on|off|status  (toggle skipping tool approvals)
-  /effort       - /effort low|medium|high|off|status  (reasoning effort; also /reasoning, /think)
+  /effort       - /effort low|medium|high|max|off|status  (reasoning effort; also /reasoning, /think)
   /goal         - /goal <objective> | show | clear  (persistent goal injected each turn)
   /goal gate    - /goal gate add <cmd> | list | rm <n> | clear | auto on|off   (completion gates)
   /goal check   - run the completion gates and report pass/fail
