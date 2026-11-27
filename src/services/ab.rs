@@ -1,47 +1,39 @@
-//! The server's abliteration switch, driven from the turn loop.
+//! The abliteration edit, asked for per request.
 //!
 //! The served checkpoint has its refusal behaviour intact; the edit that
-//! removes it is a rank-24 adapter the server can add to `o_proj` per
-//! request (`POST /ab {"scale":0|1}`, see the lane's AB-SWITCH.md). The reason
-//! it is a switch and not a checkpoint choice: removing refusal also removes
-//! the model's ability to say a thing does not exist, because declining a
-//! request and denying a premise run through the same direction in the
-//! weights. Measured on the served pair — 4/60 fabrications with it off,
-//! 18-22/60 with it on. So the model that judges a tool result, a link or a
-//! diff should be the restored one.
+//! removes it is a rank-24 adapter the server adds at `o_proj`, and a request
+//! gets it by carrying `{"vllm_xargs": {"ab_scale": 1}}` (see the lane's
+//! AB-SWITCH.md). It applies to that request's tokens and nobody else's. The
+//! reason it is a per-request choice and not a checkpoint choice: removing
+//! refusal also removes the model's ability to say a thing does not exist,
+//! because declining a request and denying a premise run through the same
+//! direction in the weights. Measured on the served pair — 4/60 fabrications
+//! with it off, 18-22/60 with it on. So the model that judges a tool result, a
+//! link or a diff should be the restored one.
 //!
 //! Which leaves exactly one REQUEST that needs the edit: the first one of a
-//! user turn, the one that decides whether to accept. Hence `auto` — on for
-//! that request, off the moment it answers:
+//! user turn, the one that decides whether to accept. Hence `auto`:
 //!
 //!     user turn starts       -> arm (no request)
-//!     turn's first request   -> on
-//!     it answers, anything   -> off
-//!     every request after    -> stays off
+//!     turn's first request   -> ab_scale 1
+//!     every request after    -> ab_scale 0 (retries, tool loop, sub-agents)
 //!     next user turn         -> arm again
 //!
-//! The off is paired with the on, inside one request, and that pairing is the
-//! whole point. It used to hang off the first TOOL CALL instead, on the
-//! assumption that a turn which accepts goes on to call one. Turns that never
-//! call a tool — a plain text answer, an empty turn, an abort, a generation the
-//! degenerate guard cuts — left the switch ON, and nothing else ever turned it
-//! off: not the end of the turn, not the next turn (which pushes the same 1.0
-//! and is skipped as already-there), not process exit.
+//! Zero trust (2026-11-27). This module used to drive a SERVER-WIDE switch,
+//! `POST /ab {"scale":0|1}`: on before the turn's first request, off after it.
+//! That switch was the engine's default for every request that did not carry
+//! its own scale, i.e. every other client's — one user's `/ab on` changed
+//! everyone's model, and measured on the live lane it did. A client cannot be
+//! trusted to leave a shared knob alone (this code is MIT; anyone can send
+//! anything), so the server no longer has one (`POST /ab` answers 410) and this
+//! client never writes server state. It only decides what to put on ITS OWN
+//! requests. That also retires the failure the old design was built around —
+//! the edit left on for hours because nothing turned it off (2026-10-01): there
+//! is no "off" to forget any more, because there is no state left behind.
 //!
-//! Measured 2026-10-01 on this install. The last tool call of the session was
-//! 16:34:51; everything after it was question-and-answer, so the edit stayed on
-//! from there. At 16:40:20 the reasoning channel collapsed into a single
-//! repeated character, and all seven repetition retries went out on the edited
-//! weights — the off was unreachable in precisely the failure mode that needed
-//! it, because a collapsed turn cannot call a tool. The turn ended on
-//! REPETITION_GIVEUP_NOTE, the next user message did the same, and `GET /ab`
-//! still read `{"scale":1.0,"mode":"abliterated"}` an hour later: the exact
-//! "switch left on for hours" this module was written to avoid. Compare the
-//! same day before the switch shipped — 13 collapses between 10:35 and 10:40,
-//! 13 escapes.
-//!
-//! `on` and `off` exist to pin the state for A/B measurement, not for daily
-//! use.
+//! `on` and `off` exist to pin the choice for A/B measurement, not for daily
+//! use. Only the conversation loop's requests carry the key; compaction and
+//! helper calls carry none and get the server default (the original weights).
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -78,106 +70,63 @@ impl Mode {
 }
 
 /// `auto` by default: the lane serves the restored checkpoint, so without the
-/// switch every request that needs the edit gets refused. A server with no
-/// `/ab` route (or an llama.cpp backend) simply fails the push and is left
-/// alone, so this default costs nothing where the feature does not exist.
-/// Override with `CODEMASON_AB=off|on|auto` for a run.
+/// edit every request that needs it gets refused. A server without the plugin
+/// (or an llama.cpp backend) ignores the key, so this default costs nothing
+/// where the feature does not exist. Override with `CODEMASON_AB=off|on|auto`.
 static MODE: Lazy<Mutex<Mode>> = Lazy::new(|| {
     let from_env = std::env::var("CODEMASON_AB").ok().and_then(|v| Mode::parse(&v));
     Mutex::new(from_env.unwrap_or(Mode::Auto))
 });
-/// Last scale we pushed, so the common case (already there) costs no request.
-static PUSHED: Lazy<Mutex<Option<f32>>> = Lazy::new(|| Mutex::new(None));
 /// Set when a user turn starts, spent by that turn's first request.
-///
-/// A latch rather than a push: arming costs no request, and nothing can be
-/// left on by arming alone, because only `begin_request` turns the switch on
-/// and it hands the caller the obligation to turn it back off.
 static ARMED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 pub fn mode() -> Mode {
     *MODE.lock()
 }
 
-/// Set the mode and bring the server in line with it right away.
-pub async fn set_mode(m: Mode) -> Result<(), String> {
+/// Set the mode. Local only: nothing is sent anywhere, now or later — the
+/// choice rides on each request (`request_scale`).
+///
+/// A pending arm is dropped: a mode typed mid-turn is the user's latest word,
+/// and a stale arm from the mode before it must not fire on their behalf.
+pub fn set_mode(m: Mode) {
     *MODE.lock() = m;
-    // Forced: a command typed by the user must reach the server, never be
-    // answered from our guess about what it already holds. See `push_inner`.
-    match m {
-        Mode::On => push_inner(1.0, true).await,
-        // Leaving auto or turning it off must not strand the server on.
-        Mode::Off | Mode::Auto => push_inner(0.0, true).await,
-    }
+    *ARMED.lock() = false;
 }
 
-/// A user turn is starting: arm the edit for that turn's FIRST request.
-///
-/// Nothing is pushed here. The push belongs to the request, so that the off can
-/// be paired with it — see `begin_request` / `end_request`.
+/// A user turn is starting: under `auto`, the turn's FIRST request gets the
+/// edit. Costs nothing — it only sets a latch that `request_scale` spends.
 pub async fn on_user_turn() {
     if mode() == Mode::Auto {
         *ARMED.lock() = true;
     }
 }
 
-/// About to send a request: under `auto`, turn the edit on iff this is the
-/// turn's first one.
+/// The `ab_scale` to put on the conversation request about to be sent.
 ///
-/// Returns whether it was turned on. The caller MUST hand that back to
-/// `end_request`, which is what makes "on" impossible to leak: there is no
-/// path that turns it on and then waits for some later event to turn it off.
-pub async fn begin_request() -> bool {
-    if mode() != Mode::Auto {
-        return false;
+/// `on` 1, `off` 0, `auto` 1 for the turn's first request and 0 for every one
+/// after it. Always an explicit value, never "whatever the server defaults
+/// to": the default is not ours, so the request says what it wants.
+pub fn request_scale() -> f32 {
+    match mode() {
+        Mode::On => 1.0,
+        Mode::Off => 0.0,
+        Mode::Auto => {
+            let mut armed = ARMED.lock();
+            let was = *armed;
+            *armed = false;
+            if was {
+                1.0
+            } else {
+                0.0
+            }
+        }
     }
-    // Scope the guard: it must be dropped before the await below.
-    let armed = {
-        let mut armed = ARMED.lock();
-        let was = *armed;
-        *armed = false;
-        was
-    };
-    if !armed {
-        return false;
-    }
-    let _ = push(1.0).await;
-    true
 }
 
-/// That request has answered — off, whatever it answered with.
-///
-/// A tool call, a sentence, an empty turn, an abort and a generation the
-/// degenerate guard cut all reach here. That is the point: the previous version
-/// turned off only on a tool call, which the collapsed turns of 2026-10-01
-/// never reached (see the module doc).
-pub async fn end_request(turned_on: bool) {
-    if !turned_on {
-        return;
-    }
-    // The mode can change while the request is in flight, and this off was
-    // armed under the mode that held when it STARTED. `/ab on` typed mid-turn
-    // pins the edit deliberately; undoing it a moment later, on the strength of
-    // a decision the user has since overridden, is how the switch ended up
-    // stuck off while the REPL said "on" (2026-11-20):
-    //
-    //   turn in flight       begin_request pushed 1.0
-    //   user types /ab on    set_mode(On) -> 1.0, prints "/ab mode: on"
-    //   turn answers         end_request pushed 0.0   <-- stomps the pin
-    //   from then on         mode is On, so begin_request returns false and
-    //                        NOTHING ever pushes 1.0 again -- every later turn
-    //                        refuses, under a display that reads "on"
-    //
-    // `Off` still pushes: parking the server is always safe, and never
-    // stranding it on is the point of the pairing.
-    if mode() == Mode::On {
-        return;
-    }
-    let _ = push(0.0).await;
-}
-
-/// Ask the server what it currently holds. Used by `/ab` with no argument, so
-/// the reported state is the server's, not our idea of it.
+/// Read the server's DEFAULT (what a request with no `ab_scale` gets), for
+/// `/ab` with no argument. Read-only: `GET /ab`. The server's default is fixed
+/// at its startup; nothing here can change it.
 pub async fn query() -> Option<(f32, bool)> {
     let (url, key) = endpoint()?;
     let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().ok()?;
@@ -204,7 +153,7 @@ pub async fn query() -> Option<(f32, bool)> {
 /// `{"scale":1.0,"mode":"abliterated"}`, the `GET` right after it answered
 /// `{"scale":0.0,"mode":"original","details":[{"default_scale":1.0,..}]}`).
 /// It is the mirror image of the 2026-11-20 bug: the display said `on` over a
-/// server at 0.0, the fix was to believe the server instead of `PUSHED`, and
+/// server at 0.0, the fix was to believe the server instead of the client's cache, and
 /// the field we started believing had quietly stopped meaning anything.
 ///
 /// `consistent` has the same hole — the server derives it from those
@@ -244,84 +193,6 @@ fn endpoint() -> Option<(String, String)> {
         return None;
     }
     Some((format!("{base}/ab"), cfg.model_api_key.clone()))
-}
-
-/// Push a scale, skipping the request when we believe the server has it.
-async fn push(scale: f32) -> Result<(), String> {
-    push_inner(scale, false).await
-}
-
-/// Push a scale. `force` sends it even when `PUSHED` says it is already there.
-///
-/// `PUSHED` is a cache over a value this process does not own, and it has no
-/// invalidation: the server resets to `GLM53_AB_SCALE` (0) whenever it
-/// restarts, and every other client sharing it pushes its own scales. So it is
-/// a guess, and it goes stale silently.
-///
-/// Measured 2026-11-20 on the live lane. `/ab on` printed `/ab mode: on` and
-/// the model went on refusing, for hours. `set_mode(On)` had called
-/// `push(1.0)`, `PUSHED` was already `Some(1.0)` from before the vLLM
-/// container was restarted the previous morning, so the shortcut returned
-/// `Ok(())` without sending anything; `GET /ab` read `0.0` the whole time. The
-/// REPL has no way to tell that apart from a push that landed, because `Ok`
-/// meant "we think so", not "the server says so".
-///
-/// Two changes, both about not trusting our own guess:
-///   * an explicit user command forces the request (`set_mode`);
-///   * `PUSHED` is set from the scale the SERVER echoes, not from what we
-///     sent, and cleared when the server does not say -- so the next push
-///     cannot be skipped on the strength of an unconfirmed one.
-///
-/// The shortcut itself stays for `auto`: there both pushes are ours, inside
-/// one turn, and the pair is re-pushed on the next turn anyway.
-///
-/// A failure is reported to the caller but never blocks the turn: a server
-/// without the plugin (or an llama.cpp backend) has no `/ab`, and that is a
-/// normal configuration, not an error worth interrupting work over.
-async fn push_inner(scale: f32, force: bool) -> Result<(), String> {
-    if !force && *PUSHED.lock() == Some(scale) {
-        return Ok(());
-    }
-    let (url, key) = match endpoint() {
-        Some(v) => v,
-        None => return Err("model_base_url is not set".into()),
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.post(&url).json(&serde_json::json!({ "scale": scale }));
-    if !key.is_empty() {
-        req = req.bearer_auth(key);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        // The push did not land, and we no longer know what the server holds.
-        *PUSHED.lock() = None;
-        return Err(format!("{code}: {}", body.trim()));
-    }
-    // Believe the server, not ourselves. Our `/ab` answers with
-    // {"scale":..,"workers":[..],"consistent":bool}; anything else (another
-    // server, an empty 200) leaves us with no confirmation, so record none and
-    // let the next push go out rather than be skipped.
-    let body = resp.text().await.unwrap_or_default();
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
-    // Through `effective`, so a POST that ever grows the per-token diagnostics
-    // is read the same way the GET is. On today's reply (scale/workers/
-    // consistent/mode) it is the top-level pair, unchanged.
-    let served = parsed.as_ref().and_then(effective);
-    *PUSHED.lock() = served.map(|(s, _)| s);
-    if let Some((s, consistent)) = served {
-        if (s - scale).abs() > 1e-6 {
-            return Err(format!("server took {s}, not {scale}"));
-        }
-        if !consistent {
-            return Err("workers disagree on the scale".into());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -368,7 +239,7 @@ mod tests {
         assert_eq!(effective(&body), Some((1.0, false)));
     }
 
-    /// A server from before the per-token change, and the POST reply, carry no
+    /// A server from before the per-token change carries no
     /// `per_token`: the top-level pair is the answer there and must stay so.
     #[test]
     fn legacy_body_still_reads_the_top_level_pair() {
@@ -391,11 +262,9 @@ mod hook_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
 
-    /// These tests drive process-global state -- `MODE`, `PUSHED`, `ARMED` and
-    /// the global `model_base_url` -- so they cannot run beside each other.
-    /// Without this they interleave: each one's pushes land on the other's stub
-    /// and both assertions read the wrong list. Async mutex, because the guard
-    /// is held across awaits.
+    /// These tests drive process-global state -- `MODE`, `ARMED` and the
+    /// global `model_base_url` -- so they cannot run beside each other. Async
+    /// mutex, because the guard is held across awaits.
     static TEST_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
     /// Minimal HTTP server: enough to record the scales we post, without
@@ -452,148 +321,77 @@ mod hook_tests {
         port
     }
 
-    /// The auto lifecycle: arming costs nothing, the turn's FIRST request is
-    /// the only one turned on, and it is turned off the moment it answers --
-    /// with no tool call anywhere in the test, because the off must not depend
-    /// on one. That dependency is the 2026-10-01 regression in the module doc:
-    /// seven retries on the edited weights and the server left at 1.0.
+    /// Zero trust (2026-11-27): the client must never write the server's
+    /// switch. `POST /ab` set the engine-wide default, which every request
+    /// without its own scale follows -- one client's `/ab on` changed every
+    /// other client's model. The server now refuses it; the client must not
+    /// rely on it either. Any request carrying a `scale` reaching the stub is a
+    /// failure, whatever the mode and whatever the turn does.
+    ///
+    /// Failed on the code before this change: `[1.0, 0.0, 0.0, 1.0]`.
     #[tokio::test]
-    async fn auto_is_on_for_the_turns_first_request_and_off_when_it_answers() {
+    async fn changing_the_mode_never_writes_the_server() {
         let _serial = TEST_LOCK.lock().await;
         let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
         let port = stub(seen.clone());
-        // Restored at the end: the endpoint is global, so leaving it pointed at
-        // this stub makes every test that runs afterwards probe a dead port.
         let previous_base_url = crate::utils::config::get_config().model_base_url;
         crate::utils::config::update_config(|c| {
             c.model_base_url = format!("http://127.0.0.1:{port}");
         });
-        *PUSHED.lock() = None;
-        *ARMED.lock() = false;
-
-        set_mode(Mode::Auto).await.unwrap(); // entering auto parks it off
-        on_user_turn().await;                // arms only
-        assert_eq!(*seen.lock(), vec![0.0], "arming must cost no request");
-
-        let on = begin_request().await;      // 1.0
-        assert!(on, "the turn's first request gets the edit");
-        end_request(on).await;               // 0.0  (no tool call involved)
-        assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0]);
-
-        // Every later request of the same turn: the latch is spent, so the
-        // switch is not touched at all -- including the repetition retries that
-        // used to run on the edited weights.
-        for _ in 0..3 {
-            let again = begin_request().await;
-            assert!(!again, "only the first request of a turn is armed");
-            end_request(again).await;
+        for m in [Mode::On, Mode::Off, Mode::Auto, Mode::On, Mode::Auto] {
+            set_mode(m);
+            on_user_turn().await;
+            let _ = request_scale();
+            let _ = request_scale();
         }
-        assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0], "no further requests");
-
-        // Pinned off: arming does nothing, so neither does the request pair.
-        // The mode command itself always goes out, even though we believe the
-        // server is already at 0.0 -- a user command is never answered from our
-        // guess (see push_inner).
-        set_mode(Mode::Off).await.unwrap();
-        on_user_turn().await;
-        assert!(!begin_request().await);
-        assert_eq!(*seen.lock(), vec![0.0, 1.0, 0.0, 0.0]);
-
+        // Give any stray background push time to land before we look.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
+        set_mode(Mode::Auto);
+        assert!(seen.lock().is_empty(), "client wrote the server switch: {:?}", seen.lock());
     }
 
-    /// `/ab on` must reach the server even when we already think it is on.
-    ///
-    /// The 2026-11-20 bug: the server had been restarted under a session whose
-    /// `PUSHED` still read 1.0, so it was back at `GLM53_AB_SCALE=0` while we
-    /// believed it was edited. `set_mode(On)` hit the already-there shortcut,
-    /// returned Ok without sending a byte, and the REPL printed "/ab mode: on"
-    /// over a server at 0.0 -- the model went on refusing and the switch looked
-    /// broken. Nothing in the process can detect that state, which is exactly
-    /// why the command may not be cached.
+    /// `auto`: the turn's first request only, every later one explicitly 0 --
+    /// retries, the tool loop and sub-agents included -- and the next turn
+    /// arms again. No tool call anywhere: nothing depends on one.
     #[tokio::test]
-    async fn an_explicit_mode_command_is_never_answered_from_the_cache() {
+    async fn auto_gives_the_edit_to_the_turns_first_request_only() {
         let _serial = TEST_LOCK.lock().await;
-        let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
-        let port = stub(seen.clone());
-        let previous_base_url = crate::utils::config::get_config().model_base_url;
-        crate::utils::config::update_config(|c| {
-            c.model_base_url = format!("http://127.0.0.1:{port}");
-        });
-
-        // Stand in for the stale belief: we think the server is at 1.0. It is
-        // not -- a restart put it back to 0.0 -- but nothing told us.
-        *PUSHED.lock() = Some(1.0);
-        *ARMED.lock() = false;
-
-        set_mode(Mode::On).await.unwrap();
-        assert_eq!(*seen.lock(), vec![1.0], "the user typed it; it must be sent");
-
-        // Same for the other direction, and for re-entering auto: both park the
-        // server, and neither may be skipped on a belief.
-        set_mode(Mode::Auto).await.unwrap();
-        set_mode(Mode::Auto).await.unwrap();
-        assert_eq!(*seen.lock(), vec![1.0, 0.0, 0.0]);
-
-        // The per-request shortcut inside `auto` is still a shortcut: both
-        // pushes of the pair are ours, within one turn.
+        set_mode(Mode::Auto);
+        assert_eq!(request_scale(), 0.0, "nothing armed before a user turn");
         on_user_turn().await;
-        let on = begin_request().await;
-        end_request(on).await;
+        assert_eq!(request_scale(), 1.0, "the deciding request");
+        assert_eq!(request_scale(), 0.0, "the request after it");
+        assert_eq!(request_scale(), 0.0);
         on_user_turn().await;
-        let on = begin_request().await;
-        end_request(on).await;
-        assert_eq!(*seen.lock(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
-
-        crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
+        assert_eq!(request_scale(), 1.0, "next turn arms again");
+        assert_eq!(request_scale(), 0.0);
+        set_mode(Mode::Auto);
     }
 
-    /// `/ab on` typed while a turn is in flight must survive that turn ending.
-    ///
-    /// The off is armed at `begin_request` under the mode that held then. When
-    /// the user pins the edit mid-turn, the pending off is a decision they have
-    /// since overridden -- and because nothing re-pushes under `On`, letting it
-    /// through strands the server off for good, with the REPL reading "on".
-    /// That is the 2026-11-20 report: refusals that began mid-session and then
-    /// would not go away no matter how often `/ab on` was typed.
+    /// `on` and `off` pin every request, and a user turn does not arm them.
     #[tokio::test]
-    async fn pinning_the_edit_mid_turn_survives_that_turn_ending() {
+    async fn on_and_off_pin_every_request() {
         let _serial = TEST_LOCK.lock().await;
-        let seen = std::sync::Arc::new(Mutex::new(Vec::<f32>::new()));
-        let port = stub(seen.clone());
-        let previous_base_url = crate::utils::config::get_config().model_base_url;
-        crate::utils::config::update_config(|c| {
-            c.model_base_url = format!("http://127.0.0.1:{port}");
-        });
-        *PUSHED.lock() = None;
-        *ARMED.lock() = false;
-
-        set_mode(Mode::Auto).await.unwrap(); // 0.0
+        set_mode(Mode::On);
         on_user_turn().await;
-        let on = begin_request().await; // 1.0 — the turn is now in flight
-        assert!(on);
-        assert_eq!(*seen.lock(), vec![0.0, 1.0]);
-
-        // The user pins it while that request is still being answered.
-        set_mode(Mode::On).await.unwrap();
-
-        // The turn answers. Its off must not undo the pin.
-        end_request(on).await;
-        assert_eq!(
-            *seen.lock(),
-            vec![0.0, 1.0, 1.0],
-            "the pending off must not stomp a mode the user pinned mid-turn"
-        );
-
-        // And it stays on: under `On` nothing re-pushes, so a stomp here would
-        // never be corrected.
+        assert_eq!([request_scale(), request_scale(), request_scale()], [1.0; 3]);
+        set_mode(Mode::Off);
         on_user_turn().await;
-        let again = begin_request().await;
-        assert!(!again, "On does not arm per-request");
-        end_request(again).await;
-        assert_eq!(*seen.lock(), vec![0.0, 1.0, 1.0], "still pinned on");
+        assert_eq!([request_scale(), request_scale()], [0.0; 2]);
+        set_mode(Mode::Auto);
+    }
 
-        set_mode(Mode::Auto).await.unwrap(); // park it for the next test
-        crate::utils::config::update_config(|c| c.model_base_url = previous_base_url);
+    /// A mode typed mid-turn wins over an arm left by the mode before it.
+    #[tokio::test]
+    async fn a_mode_typed_mid_turn_drops_the_pending_arm() {
+        let _serial = TEST_LOCK.lock().await;
+        set_mode(Mode::Auto);
+        on_user_turn().await;
+        set_mode(Mode::Off);
+        assert_eq!(request_scale(), 0.0);
+        set_mode(Mode::Auto);
+        assert_eq!(request_scale(), 0.0, "the old arm must not fire after switching back");
+        set_mode(Mode::Auto);
     }
 }

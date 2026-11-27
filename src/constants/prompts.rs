@@ -142,8 +142,8 @@ pub fn get_actions_section() -> &'static str {
 /// reserved for real blockers, impasse-stop legalized).
 /// [ours — not in upstream external build] Covers the ONE request per turn
 /// that runs on abliterated weights. services::ab runs `auto`: the turn's
-/// first request goes out at scale=1 and the edit is pushed off the moment it
-/// answers, so a tool-using turn is already protected — but a turn that calls
+/// first request goes out with ab_scale=1 and every request after it carries
+/// ab_scale=0 (per request; no server switch since 11-27), so a tool-using turn is already protected — but a turn that calls
 /// no tool spends its whole answer in that window with nothing holding it
 /// back (44% fabrication on the held-out invented subjects; 0 with this
 /// section, and the unedited requests after it lose nothing: 0/39 either

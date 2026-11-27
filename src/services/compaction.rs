@@ -1119,6 +1119,8 @@ pub async fn compact_conversation(
                 // Compaction is bookkeeping for whichever conversation owns it;
                 // it keeps the server default (0) rather than yielding.
                 priority: None,
+                // No key: compaction gets the server default (original weights).
+                ab_scale: None,
             },
             on_token_update: on_token_update.clone(),
             on_content_delta: None,

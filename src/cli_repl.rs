@@ -925,28 +925,35 @@ pub async fn dispatch_builtin(
 
         "ab" => {
             use crate::services::ab::{self, Mode};
-            let want = body.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
-            if want.is_empty() {
-                let served = match ab::query().await {
+            // Default the server gives a request that carries no ab_scale.
+            // Read-only: nothing here can change it (services::ab).
+            async fn served() -> String {
+                match ab::query().await {
                     Some((scale, consistent)) => {
                         let state = if scale > 0.0 { "on (abliterated)" } else { "off (restored)" };
                         if consistent {
-                            format!("server: {state}")
+                            format!("server default: {state}")
                         } else {
-                            format!("server: {state} — WORKERS DISAGREE")
+                            format!("server default: {state} — WORKERS DISAGREE")
                         }
                     }
                     None => "server: no /ab endpoint".to_string(),
-                };
+                }
+            }
+            let want = body.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
+            if want.is_empty() {
                 cmprintln!(
-                    "/ab mode: {}\n{served}\n\n\
-                     off   leave the server alone\n\
-                     on    pin the refusal edit on — for measurement\n\
-                     auto  on for the turn's first request, off as soon as it answers (default)\n\n\
+                    "/ab mode: {}\n{}\n\n\
+                     off   every request asks for the original weights\n\
+                     on    every request asks for the refusal edit — for measurement\n\
+                     auto  only the turn's first request asks for it (default)\n\n\
+                     Sent on each request (vllm_xargs.ab_scale) and applied to that request\n\
+                     only; the server switch is never touched, so no one else is affected.\n\
                      The edit also costs the model its ability to say something does not exist\n\
                      (4/60 fabrications off, 18-22/60 on), so auto keeps it off for every tool\n\
                      result, link and diff — only the deciding turn gets it.",
-                    ab::mode().as_str()
+                    ab::mode().as_str(),
+                    served().await
                 );
                 return Dispatch::Handled;
             }
@@ -954,27 +961,8 @@ pub async fn dispatch_builtin(
                 cmprintln!("Unknown mode: {want}   (off | on | auto)");
                 return Dispatch::Handled;
             };
-            // Report what the SERVER holds, not what we asked for: "/ab mode:
-            // on" used to print on a push that was silently skipped as
-            // already-there, while the server sat at 0.0 (see services::ab).
-            match ab::set_mode(m).await {
-                Ok(()) => {
-                    let served = match ab::query().await {
-                        Some((scale, consistent)) => {
-                            let state =
-                                if scale > 0.0 { "on (abliterated)" } else { "off (restored)" };
-                            if consistent {
-                                format!("server: {state}")
-                            } else {
-                                format!("server: {state} — WORKERS DISAGREE")
-                            }
-                        }
-                        None => "server: no /ab endpoint".to_string(),
-                    };
-                    cmprintln!("/ab mode: {}\n{served}", m.as_str());
-                }
-                Err(e) => cmprintln!("/ab mode: {} — server not updated: {e}", m.as_str()),
-            }
+            ab::set_mode(m);
+            cmprintln!("/ab mode: {} (sent per request)\n{}", m.as_str(), served().await);
             Dispatch::Handled
         }
 

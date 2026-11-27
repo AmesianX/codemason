@@ -1438,6 +1438,26 @@ pub struct QueryOptions {
     /// before waiting sub-agents. `None` sends no key at all — the main
     /// conversation, compaction and every helper call stay exactly as before.
     pub priority: Option<i64>,
+    /// The abliteration edit for THIS request only, sent as
+    /// `vllm_xargs.ab_scale` (see services::ab). The conversation loop always
+    /// sets it (0 or 1, never left to the server's default); `None` -- compaction
+    /// and helper calls -- sends no key and gets the server default, the
+    /// original weights. vLLM backend only.
+    pub ab_scale: Option<f32>,
+}
+
+/// The `vllm_xargs` object to put on the wire for this request, if any.
+///
+/// vLLM only (llama.cpp has no such field). The server validates the value
+/// itself and runs anything that is not a finite number in [0, 1] on the
+/// original weights; this side sends only 0 or 1 anyway.
+fn wire_vllm_xargs(ab_scale: Option<f32>, vllm_backend: bool) -> Option<Value> {
+    match ab_scale {
+        Some(s) if vllm_backend && s.is_finite() => {
+            Some(json!({ "ab_scale": if s > 0.0 { 1 } else { 0 } }))
+        }
+        _ => None,
+    }
 }
 
 /// Priority sent on sub-agent requests (main conversation: none = 0).
@@ -2700,6 +2720,11 @@ async fn query_openai_compatible_inner(
         }
         None => false,
     };
+
+    // The /ab edit, per request (vLLM only). See QueryOptions::ab_scale.
+    if let Some(x) = wire_vllm_xargs(options.ab_scale, continuous_usage_stats) {
+        request_body["vllm_xargs"] = x;
+    }
 
     debug_log("REQUEST BODY", Some(&request_body));
 
@@ -4561,6 +4586,24 @@ mod vision_convert_tests {
             user(vec![tool_result("t", vec![img_item()])]),
         ];
         assert_eq!(attached_image_count(&conv, 8), 1);
+    }
+}
+
+#[cfg(test)]
+mod ab_wire_tests {
+    use super::*;
+
+    #[test]
+    fn ab_scale_rides_on_the_request_for_vllm_only() {
+        assert_eq!(wire_vllm_xargs(Some(1.0), true), Some(json!({"ab_scale": 1})));
+        assert_eq!(
+            wire_vllm_xargs(Some(0.0), true),
+            Some(json!({"ab_scale": 0})),
+            "off is said explicitly, not left to the server default"
+        );
+        assert_eq!(wire_vllm_xargs(None, true), None, "compaction/helpers: no key");
+        assert_eq!(wire_vllm_xargs(Some(1.0), false), None, "llama.cpp: never");
+        assert_eq!(wire_vllm_xargs(Some(f32::NAN), true), None, "never put NaN on the wire");
     }
 }
 

@@ -652,11 +652,12 @@ pub fn query(params: QueryParams) -> MsgStream {
 
         // Query the model.
         let tools = tool_use_context.options.tools.clone();
-        // `/ab auto`: the turn's first request is the one deciding whether to
-        // accept, and the only one that wants the refusal edit. On here, off as
-        // soon as it answers (below) — the two are paired inside this request,
-        // so no outcome can leave the switch on. See services::ab.
-        let ab_edit = crate::services::ab::begin_request().await;
+        // `/ab`: this request's own ab_scale -- under `auto`, 1 for the turn's
+        // first request (the one deciding whether to accept) and 0 for every
+        // one after it, retries and sub-agents included. Carried on the
+        // request itself; nothing on the server is switched, so nothing can be
+        // left on and no other client is affected. See services::ab.
+        let ab_scale = crate::services::ab::request_scale();
         let mut assistant_message = query_model(QueryModelParams {
             messages: messages.clone(),
             system_prompt: vec![full_system_prompt],
@@ -681,6 +682,7 @@ pub fn query(params: QueryParams) -> MsgStream {
                     .agent_id
                     .as_ref()
                     .map(|_| crate::services::openai_common::SUBAGENT_PRIORITY),
+                ab_scale: Some(ab_scale),
                 // NOTE (2026-09-28): every recovery recursion now passes
                 // suppress_reasoning: false, so both of these are false for
                 // conversation requests. Compaction sets its own no_reasoning
@@ -723,11 +725,6 @@ pub fn query(params: QueryParams) -> MsgStream {
             on_thinking_update: tool_use_context.on_thinking_update.clone(),
         })
         .await;
-        // Off, whatever came back: a tool call, a sentence, an empty turn, an
-        // abort, or a generation the degenerate guard cut. Every recursion below
-        // — repetition retries included — runs on the restored weights.
-        crate::services::ab::end_request(ab_edit).await;
-
         if tool_use_context.is_aborted() {
             yield Message::Assistant(create_assistant_message_obj(INTERRUPT_MESSAGE));
             return;
