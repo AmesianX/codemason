@@ -1,0 +1,114 @@
+# Release builds: push a tag `v*` and every platform below is built and attached to the GitHub release
+# as a ready-to-run bundle (no Rust needed on the user's machine):
+#   codemason-<tag>-<target>.tar.gz | .zip   ->   codemason[.exe]  vendor/ripgrep/<arch-os>/  tokenizer/
+# Supply chain: only GitHub's own actions; ripgrep for macOS (not vendored in the repo) is downloaded from
+# its official release and checked against pinned SHA-256s; SHA256SUMS covers every bundle.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build, e.g. v3.0.0"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     vendor: x64-linux,   ext: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, vendor: arm64-linux, ext: tar.gz }
+          - { target: aarch64-apple-darwin,      os: macos-14,         vendor: arm64-darwin, ext: tar.gz, rg: aarch64-apple-darwin, rg_sha: 24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be }
+          - { target: x86_64-apple-darwin,       os: macos-14,         vendor: x64-darwin,  ext: tar.gz, rg: x86_64-apple-darwin,  rg_sha: fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3 }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest,   vendor: x64-win32,   ext: zip }
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: ripgrep for macOS (pinned)
+        if: matrix.rg != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=ripgrep-14.1.1-${{ matrix.rg }}.tar.gz
+          curl -fsSL -o "$f" "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/$f"
+          echo "${{ matrix.rg_sha }}  $f" | shasum -a 256 -c -
+          tar -xzf "$f"
+          mkdir -p "vendor/ripgrep/${{ matrix.vendor }}"
+          install -m 755 "ripgrep-14.1.1-${{ matrix.rg }}/rg" "vendor/ripgrep/${{ matrix.vendor }}/rg"
+
+      - name: Bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="codemason-$TAG-${{ matrix.target }}"
+          mkdir -p "dist/$name/vendor/ripgrep"
+          exe=codemason; [ "${{ matrix.ext }}" = zip ] && exe=codemason.exe
+          cp "target/${{ matrix.target }}/release/$exe" "dist/$name/"
+          cp -R "vendor/ripgrep/${{ matrix.vendor }}" "dist/$name/vendor/ripgrep/"
+          cp vendor/ripgrep/COPYING "dist/$name/vendor/ripgrep/" 2>/dev/null || true
+          cp -R tokenizer "dist/$name/"
+          cp LICENSE "dist/$name/"
+          cd dist
+          if [ "${{ matrix.ext }}" = zip ]; then
+            7z a -tzip "$name.zip" "$name" >/dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/codemason-*.${{ matrix.ext }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum codemason-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" \
+                 --notes "Prebuilt codemason (cm2). Unpack, then run the binary inside; see SHA256SUMS."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber codemason-* SHA256SUMS
