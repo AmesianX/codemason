@@ -29,8 +29,8 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     vendor: x64-linux,   ext: tar.gz }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, vendor: arm64-linux, ext: tar.gz }
-          - { target: aarch64-apple-darwin,      os: macos-14,         vendor: arm64-darwin, ext: tar.gz, rg: aarch64-apple-darwin, rg_sha: 24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be }
-          - { target: x86_64-apple-darwin,       os: macos-14,         vendor: x64-darwin,  ext: tar.gz, rg: x86_64-apple-darwin,  rg_sha: fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3 }
+          - { target: aarch64-apple-darwin,      os: macos-latest,         vendor: arm64-darwin, ext: tar.gz, rg: aarch64-apple-darwin, rg_sha: 24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be }
+          - { target: x86_64-apple-darwin,       os: macos-latest,         vendor: x64-darwin,  ext: tar.gz, rg: x86_64-apple-darwin,  rg_sha: fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3 }
           - { target: x86_64-pc-windows-msvc,    os: windows-latest,   vendor: x64-win32,   ext: zip }
     runs-on: ${{ matrix.os }}
     env:
